@@ -24,6 +24,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+acp = ["websockets>=15.0.1,<17"]
 deepagents = [
     "anthropic<1",
     "botocore>=1.31.57,<2",

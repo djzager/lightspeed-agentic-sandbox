@@ -1905,6 +1905,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+acp = [
+    { name = "websockets" },
+]
 all = [
     { name = "aiohttp" },
     { name = "anthropic" },
@@ -2049,8 +2052,9 @@ requires-dist = [
     { name = "tomlkit", marker = "extra == 'dev'", specifier = ">=0.14.0" },
     { name = "urllib3", specifier = ">=1.24.2,<3" },
     { name = "uvicorn", marker = "extra == 'e2e'", specifier = ">=0.31.1" },
+    { name = "websockets", marker = "extra == 'acp'", specifier = ">=15.0.1,<17" },
 ]
-provides-extras = ["deepagents", "openai", "all", "dev", "e2e"]
+provides-extras = ["acp", "deepagents", "openai", "all", "dev", "e2e"]
 
 [[package]]
 name = "mako"
