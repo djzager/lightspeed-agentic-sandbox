@@ -347,10 +347,12 @@ def _create_generation_callback(
             tags = tags or []
             metadata = metadata or {}
             if usage_observer is not None and "nostream" not in tags:
-                self._usage_runs[run_id] = (
-                    metadata.get("lc_agent_name") == self._main_name
-                    and metadata.get("lc_source") != "summarization"
-                )
+                self._usage_runs[run_id] = metadata.get(
+                    "lc_agent_name"
+                ) == self._main_name and metadata.get("lc_source") not in {
+                    "summarization",
+                    "structured_output_shaping",
+                }
             if (
                 metadata.get("lc_agent_name") != self._main_name
                 or "nostream" in tags
@@ -553,7 +555,10 @@ async def _shape_structured_output(
         ]
         result = await structured.ainvoke(
             shape_messages,
-            config={"callbacks": [generation_callback]},
+            config={
+                "callbacks": [generation_callback],
+                "metadata": {"lc_source": "structured_output_shaping"},
+            },
         )
     except BaseException as exc:
         generation_callback.close_open(type(exc).__name__)

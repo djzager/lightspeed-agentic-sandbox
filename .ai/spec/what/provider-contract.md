@@ -30,7 +30,8 @@ tool completes. A consumption event carries its message ID. Guidance accepted du
 final model response receives a follow-up invocation before the run's terminal result.
 For sessions, `max_turns` bounds completed main model calls per prompt. Tools selected by
 the final allowed call execute and cross the existing inspection/output gates; the next
-main model call is prevented. Steering shares that prompt budget. An independent generous
+main model call is prevented. Steering shares that prompt budget. Separate tool-free
+structured-output shaping contributes usage but does not spend a main graph turn. An independent generous
 LangGraph recursion limit protects graph execution. One-shot queries retain their existing
 caller-supplied graph recursion limit. Terminal results expose `end_turn`, `max_turns`, or
 `cancelled`, plus observed completed main model calls as `turns_used`.

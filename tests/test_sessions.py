@@ -515,3 +515,23 @@ async def test_permission_grant_is_awaited_before_shell_execution(tmp_path: Path
     assert (await task)[-1].text == "done"
     assert marker.exists()
     await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_shaping_usage_is_counted_without_spending_a_main_model_turn(tmp_path: Path) -> None:
+    main = AIMessage(
+        content="answer", usage_metadata={"input_tokens": 3, "output_tokens": 2, "total_tokens": 5}
+    )
+    shaped = _call("OutputModel", {"value": "okay"}, "shape")
+    shaped.usage_metadata = {"input_tokens": 7, "output_tokens": 4, "total_tokens": 11}
+    session, _factory, _inputs = _session(tmp_path, [main, shaped])
+    session._options.output_schema = {
+        "type": "object",
+        "properties": {"value": {"type": "string"}},
+        "required": ["value"],
+    }
+    events = await _collect(session, max_turns=1)
+    assert events[-1].stop_reason == "end_turn"
+    assert events[-1].turns_used == 1
+    assert session.usage == UsageSnapshot(10, 6)
+    await session.aclose()
