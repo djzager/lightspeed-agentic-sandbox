@@ -81,11 +81,12 @@ class ACPConnection:
         async with self.send_lock:
             await self.websocket.send(json.dumps({"jsonrpc": "2.0", **message}, allow_nan=False))
 
-    async def update(self, session_id: str, update: dict[str, Any]) -> None:
-        self.sessions[session_id].history.append(update)
-        await self.send(
-            {"method": "session/update", "params": {"sessionId": session_id, "update": update}}
-        )
+    async def update(
+        self, session_id: str, update: dict[str, Any], *, method: str = "session/update"
+    ) -> None:
+        envelope = {"method": method, "params": {"sessionId": session_id, "update": update}}
+        self.sessions[session_id].history.append(envelope)
+        await self.send(envelope)
 
     async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         request_id = "lightspeed-" + uuid4().hex
@@ -273,13 +274,8 @@ class ACPConnection:
                 self.config.validate_session(params)
             except ValueError as exc:
                 raise RPCError(-32602, "session configuration rejected") from exc
-            for update in list(state.history):
-                await self.send(
-                    {
-                        "method": "session/update",
-                        "params": {"sessionId": session_id, "update": update},
-                    }
-                )
+            for envelope in list(state.history):
+                await self.send(envelope)
             return {}
         if state.owner is not self:
             raise RPCError(-32000, "session belongs to another connection")
@@ -312,9 +308,15 @@ class ACPConnection:
         state.cancel_requested = False
         state.history.append(
             {
-                "sessionUpdate": "user_message_chunk",
-                "content": {"type": "text", "text": prompt},
-                "_meta": {"goose": {"messageId": uuid4().hex}},
+                "method": "session/update",
+                "params": {
+                    "sessionId": session_id,
+                    "update": {
+                        "sessionUpdate": "user_message_chunk",
+                        "content": {"type": "text", "text": prompt},
+                        "_meta": {"goose": {"messageId": uuid4().hex}},
+                    },
+                },
             }
         )
         await self.update(
@@ -403,7 +405,7 @@ class ACPConnection:
                 turns = getattr(event, "turns_used", None)
                 if type(turns) is int and turns >= 0:
                     update["_meta"] = {"lightspeed": {"turnsUsed": turns}}
-                await self.update(session_id, update)
+                await self.update(session_id, update, method="_lightspeed/session/update")
                 if kind == "result":
                     reason = getattr(event, "stop_reason", "end_turn")
                     stop_reason = "max_turn_requests" if reason == "max_turns" else reason

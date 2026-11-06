@@ -166,6 +166,11 @@ async def test_two_prompts_cumulative_usage(tmp_path):
             assert usage[-1]["inputTokens"] == (request_id - 2) * 10
             assert usage[-1]["outputTokens"] == (request_id - 2) * 2
             assert "cost" not in usage[-1]
+            assert all(
+                u["method"] == "_lightspeed/session/update"
+                for u in updates
+                if u["params"]["update"]["sessionUpdate"] == "usage_update"
+            )
         assert len(provider.sessions) == 1
         assert provider.sessions[0].prompts == [("first", 7), ("second", 7)]
 
@@ -291,6 +296,32 @@ async def test_viewer_load_replays_history_and_disconnect_preserves_owner(tmp_pa
         )
         result, _ = await response(owner, 3)
         assert result["result"]["stopReason"] == "cancelled"
+
+
+async def test_replay_preserves_cumulative_usage_extension_method(tmp_path):
+    async with server(tmp_path) as (url, _provider, config), connect(url) as owner:
+        session_id = await initialize(owner, config)
+        await send(owner, 3, "session/prompt", prompt(session_id, "first"))
+        await response(owner, 3)
+        async with connect(url) as viewer:
+            await send(viewer, 1, "initialize", {"protocolVersion": 1})
+            await response(viewer, 1)
+            await send(
+                viewer,
+                2,
+                "session/load",
+                {"sessionId": session_id, "cwd": config.cwd, "mcpServers": []},
+            )
+            result, updates = await response(viewer, 2)
+            assert result["result"] == {}
+            usage_frames = [
+                frame
+                for frame in updates
+                if frame["params"]["update"]["sessionUpdate"] == "usage_update"
+            ]
+            assert usage_frames
+            assert all(frame["method"] == "_lightspeed/session/update" for frame in usage_frames)
+            assert usage_frames[-1]["params"]["update"]["inputTokens"] == 10
 
 
 class AwaitingPermissionProvider:
