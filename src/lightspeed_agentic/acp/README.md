@@ -43,6 +43,12 @@ cancel a session. Viewer steering uses the harness-compatible
 enters the conversation at the next main-model boundary. Run/message metadata
 uses `_meta.goose` for existing UI compatibility. Terminal model-turn count is
 reported as `_meta.lightspeed.turnsUsed` in the prompt response.
+The owner can reduce an individual prompt's budget with
+`_meta.lightspeed.maxTurns`, a strictly positive integer clamped to the configured
+`max_turns` ceiling. The harness uses this for the remaining handoff allowance;
+omitting it keeps the configured ceiling. Budgets count completed main-model
+calls, and tools selected by the final allowed call still execute and pass
+inspection before the next model call is stopped.
 
 ## Cumulative usage extension
 

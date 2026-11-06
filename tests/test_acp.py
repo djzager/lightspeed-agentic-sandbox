@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import signal
 import sys
 from contextlib import asynccontextmanager, suppress
@@ -263,6 +264,35 @@ async def test_launcher_approval_policy_cannot_be_reduced(tmp_path):
         assert (await receive(ws))["result"] == {}
 
 
+@pytest.mark.parametrize(("requested", "expected"), [(2, 2), (100, 7)])
+async def test_prompt_turn_budget_is_clamped_to_launcher_ceiling(tmp_path, requested, expected):
+    async with server(tmp_path) as (url, provider, config), connect(url) as ws:
+        session_id = await initialize(ws, config)
+        await send(
+            ws,
+            3,
+            "session/prompt",
+            {**prompt(session_id, "handoff"), "_meta": {"lightspeed": {"maxTurns": requested}}},
+        )
+        result, _ = await response(ws, 3)
+        assert result["result"]["stopReason"] == "end_turn"
+        assert provider.sessions[0].prompts == [("handoff", expected)]
+
+
+@pytest.mark.parametrize("requested", [True, 0, -1, "2", None])
+async def test_invalid_prompt_turn_budget_is_rejected_before_execution(tmp_path, requested):
+    async with server(tmp_path) as (url, provider, config), connect(url) as ws:
+        session_id = await initialize(ws, config)
+        await send(
+            ws,
+            3,
+            "session/prompt",
+            {**prompt(session_id, "handoff"), "_meta": {"lightspeed": {"maxTurns": requested}}},
+        )
+        assert (await receive(ws))["error"]["code"] == -32602
+        assert provider.sessions[0].prompts == []
+
+
 async def test_viewer_load_replays_history_and_disconnect_preserves_owner(tmp_path):
     async with server(tmp_path) as (url, provider, config), connect(url) as owner:
         session_id = await initialize(owner, config)
@@ -332,6 +362,15 @@ class AwaitingPermissionProvider:
 
     async def _query(self, _options, *, session):
         await session.permission_callback(ToolPermissionRequest("execute", {}, "pending-1"))
+        yield ResultEvent()
+
+
+class AwaitingHumanProvider(AwaitingPermissionProvider):
+    async def _query(self, _options, *, session):
+        await session.user_input_callback(
+            UserInputRequest("Choose database", ("postgres", "mysql"))
+        )
+        yield TextDeltaEvent(text="must only continue with an answer")
         yield ResultEvent()
 
 
@@ -536,3 +575,64 @@ mcp.run(transport="stdio")
             assert "postgres" in updates[0]["params"]["update"]["content"]["text"]
         else:
             assert result["error"]["message"] == "runtime operation failed"
+
+
+@pytest.mark.parametrize("cancel_prompt", [True, False])
+async def test_real_session_pending_stdio_elicitation_is_fail_closed_and_reaped(
+    tmp_path, cancel_prompt
+):
+    script = tmp_path / "pending_ask.py"
+    script.write_text("""import os
+from pathlib import Path
+from mcp.server.fastmcp import FastMCP, Context
+from pydantic import BaseModel
+Path(__file__).with_suffix(".pid").write_text(str(os.getpid()))
+mcp = FastMCP("trusted-ask-user")
+class Answer(BaseModel):
+    answer: str
+@mcp.tool()
+async def ask_user(question: str, options: list[str], ctx: Context) -> str:
+    result = await ctx.elicit(question, Answer)
+    return result.data.answer if result.action == "accept" else "No answer"
+mcp.run(transport="stdio")
+""")
+    trusted = AskUserConfig(command=sys.executable, args=[str(script)])
+    async with (
+        server(tmp_path, ask_user=trusted, provider_override=AwaitingHumanProvider()) as (
+            url,
+            _provider,
+            config,
+        ),
+        connect(url) as ws,
+    ):
+        session_id = await initialize(ws, config)
+        await send(ws, 3, "session/prompt", prompt(session_id, "ask"))
+        await receive(ws)
+        ask = await receive(ws)
+        assert ask["method"] == "elicitation/create"
+        helper_pid = int(script.with_suffix(".pid").read_text())
+        if cancel_prompt:
+            await ws.send(
+                json.dumps(
+                    {
+                        "jsonrpc": "2.0",
+                        "method": "session/cancel",
+                        "params": {"sessionId": session_id},
+                    }
+                )
+            )
+        else:
+            # The headless harness returns this when there is no viewer to answer.
+            await ws.send(
+                json.dumps({"jsonrpc": "2.0", "id": ask["id"], "result": {"action": "cancel"}})
+            )
+        result, updates = await response(ws, 3)
+        if cancel_prompt:
+            assert result["result"]["stopReason"] == "cancelled"
+        else:
+            assert result["error"]["message"] == "runtime operation failed"
+        assert not any(
+            frame["params"]["update"]["sessionUpdate"] == "agent_message_chunk" for frame in updates
+        )
+        with pytest.raises(ProcessLookupError):
+            os.kill(helper_pid, 0)

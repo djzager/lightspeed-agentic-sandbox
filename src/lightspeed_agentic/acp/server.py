@@ -302,6 +302,16 @@ class ACPConnection:
         if method != "session/prompt":
             raise RPCError(-32601, "method not supported")
         prompt = _prompt(params)
+        max_turns = self.config.max_turns
+        meta = params.get("_meta", {})
+        if not isinstance(meta, dict) or not isinstance(meta.get("lightspeed", {}), dict):
+            raise RPCError(-32602, "invalid prompt metadata")
+        lightspeed_meta = meta.get("lightspeed", {})
+        if "maxTurns" in lightspeed_meta:
+            requested_turns = lightspeed_meta["maxTurns"]
+            if type(requested_turns) is not int or requested_turns <= 0:
+                raise RPCError(-32602, "maxTurns must be a positive integer")
+            max_turns = min(max_turns, requested_turns)
         if state.run_id is not None:
             raise RPCError(-32000, "session already has an active prompt")
         state.run_id, state.message_id = uuid4().hex, uuid4().hex
@@ -325,7 +335,7 @@ class ACPConnection:
         )
         try:
             async with asyncio.timeout(self.timeout_seconds):
-                stop_reason = await self.consume(session_id, state, prompt)
+                stop_reason = await self.consume(session_id, state, prompt, max_turns=max_turns)
                 result: dict[str, Any] = {"stopReason": stop_reason}
                 turns = getattr(state.runtime, "turns_used", None)
                 if type(turns) is int and turns >= 0:
@@ -334,11 +344,13 @@ class ACPConnection:
         finally:
             state.run_id = None
 
-    async def consume(self, session_id: str, state: SessionState, prompt: str) -> str:
+    async def consume(
+        self, session_id: str, state: SessionState, prompt: str, *, max_turns: int
+    ) -> str:
         if state.cancel_requested:
             return "cancelled"
         stop_reason = "end_turn"
-        async for event in state.runtime.prompt(prompt, max_turns=self.config.max_turns):
+        async for event in state.runtime.prompt(prompt, max_turns=max_turns):
             kind = event.type
             if kind == "user_message":
                 state.message_id = uuid4().hex
