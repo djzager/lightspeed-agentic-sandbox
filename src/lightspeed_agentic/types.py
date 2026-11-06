@@ -55,6 +55,25 @@ class ToolResultEvent:
 
 
 @dataclass(frozen=True)
+class UserMessageEvent:
+    type: Literal["user_message"] = field(default="user_message", init=False)
+    text: str = ""
+    message_id: str = ""
+
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class UsageEvent:
+    type: Literal["usage"] = field(default="usage", init=False)
+    usage: UsageSnapshot = field(default_factory=UsageSnapshot)
+
+
+@dataclass(frozen=True)
 class ResultEvent:
     type: Literal["result"] = field(default="result", init=False)
     text: str = ""
@@ -62,6 +81,8 @@ class ResultEvent:
     output_tokens: int = 0
     reasoning_tokens: int = 0
     response_model: str = ""
+    stop_reason: Literal["end_turn", "max_turns", "cancelled"] = "end_turn"
+    turns_used: int | None = None
 
 
 ProviderEvent = (
@@ -71,6 +92,8 @@ ProviderEvent = (
     | ToolCallEvent
     | ToolResultEvent
     | ResultEvent
+    | UsageEvent
+    | UserMessageEvent
 )
 
 

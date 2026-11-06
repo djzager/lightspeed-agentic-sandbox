@@ -8,6 +8,55 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
 Anthropic, Vertex/Google, and native/custom OpenAI use DeepAgents. Native OpenAI means hosting `openai` with the default endpoint or an HTTPS `api.openai.com` hostname; [configuration rule 3a](configuration.md) defines URL precedence, normalization, and rejection of non-HTTPS native URLs. Custom/vLLM selects the `openai-compatible` DeepAgents route on Chat Completions. Azure also uses the shared DeepAgents harness through `AzureChatOpenAI`; Vertex supports only Anthropic and Google models; the legacy OpenAI adapter and factory entry are removed. Azure routing/workflows are offline-tested, not live-authentication acceptance. Shared DeepAgents rules below apply to native/custom OpenAI and Azure as well; Agents SDK-specific requirements below (`SandboxAgent`, `Runner`, `ModelResponse`, and its hooks) document the retired harness only; they no longer apply to runtime routes. Shared DeepAgents rules govern every implemented route. This implementation split does not complete the broader consolidation or waive live evidence and telemetry compatibility review.
 
+## Reusable in-memory sessions
+
+`DeepAgentsProvider.create_session(options, permission_callback=..., user_input_callback=...)`
+creates a transport-independent `RuntimeSession`. Construction is lazy. The session owns
+one stable thread ID, in-memory LangGraph checkpointer, compiled graph, and main/classifier
+model clients. Repeated `prompt()` calls retain conversation history; simultaneous prompts
+serialize. `query()` preserves its one-shot lifecycle and per-query token totals.
+
+Session mode defaults to `auto`. In `approve` mode an async permission callback must return
+approval immediately before SDK tool execution; missing callbacks deny execution. The
+optional local `ask_user` tool calls a trusted async user-input callback, without requiring
+approval for asking the user. A matching successful result is trusted only when this local
+tool was registered; conflicting admitted MCP names fail before graph execution. External
+tool results still pass the existing model-boundary inspection and independent normalized
+output release gate. Conventional `$HOME/.agents/skills` is exposed at `/skills/user/` in
+addition to skills under the working directory; rules remain caller-supplied instructions.
+
+`steer(text)` queues user guidance until the next main-model boundary, after any active
+tool completes. A consumption event carries its message ID. Guidance accepted during a
+final model response receives a follow-up invocation before the run's terminal result.
+For sessions, `max_turns` bounds completed main model calls per prompt. Tools selected by
+the final allowed call execute and cross the existing inspection/output gates; the next
+main model call is prevented. Steering shares that prompt budget. An independent generous
+LangGraph recursion limit protects graph execution. One-shot queries retain their existing
+caller-supplied graph recursion limit. Terminal results expose `end_turn`, `max_turns`, or
+`cancelled`, plus observed completed main model calls as `turns_used`.
+
+`cancel()` cancels and awaits the active graph/tool coroutine. Session shell execution uses
+an awaitable POSIX subprocess backend, killing and reaping the shell process group on
+cancellation or timeout; this platform scope is Linux/macOS, not Windows. Completed effects
+are not rolled back. Unanswered calls receive stopped results in the checkpoint so a later
+prompt does not replay them. `aclose()` cancels active work and closes owned clients once.
+Session state is ephemeral and is not restorable after process exit.
+
+`session.usage` and `UsageEvent` carry cumulative observed input/output counts across
+prompts, updated after model completions, including main, subagent, summarization, and
+structured-output shaping calls. Isolated safety-classifier requests are excluded. Missing
+counts remain `None`; explicit zero remains zero. No cost or pricing is inferred. Legacy
+integer fields on `ResultEvent` retain their existing zero defaults; consumers that need
+presence semantics use the usage snapshot. Completed-call usage remains available if a
+later tool or model call is cancelled. Provider-native cost and context-window occupancy
+are not supplied by this core contract.
+
+Verification: `tests/test_sessions.py` uses real offline DeepAgents graphs for retained
+history, prompt serialization, steering, permission denial/grant, trusted user input,
+inspection rejection before model/client release, cumulative usage, cleanup, actual model
+coroutine cancellation, and shell child-process cancellation without delayed file effects.
+Existing provider/inspection suites continue to exercise the one-shot lifecycle.
+
 ## Behavioral Rules
 
 1. **AgentProvider.** Each backend implements a `name` property and a `query` method accepting `ProviderQueryOptions` and returning an async iterator of `ProviderEvent`.

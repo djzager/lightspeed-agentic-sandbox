@@ -47,8 +47,19 @@ def _wrap_tool_output(content: Any, tool_name: str) -> str:
     return f'<tool_data source="{escaped_name}">\n{escaped_content}\n</tool_data>'
 
 
-def _is_trusted_tool_result(result: ToolMessage, call: ToolCall | None) -> bool:
-    """Apply source trust policy; currently only mounted skill-file reads are trusted."""
+def _is_trusted_tool_result(
+    result: ToolMessage,
+    call: ToolCall | None,
+    trusted_tool_names: frozenset[str] = frozenset(),
+) -> bool:
+    """Trust mounted skill reads and explicitly registered local user-input tools."""
+    if (
+        call is not None
+        and result.status == "success"
+        and result.name in trusted_tool_names
+        and call["name"] == result.name
+    ):
+        return True
     if (
         call is None
         or result.status != "success"
@@ -66,7 +77,10 @@ def _is_trusted_tool_result(result: ToolMessage, call: ToolCall | None) -> bool:
     )
 
 
-def filter_untrusted_tool_results(messages: Sequence[AnyMessage]) -> list[ToolMessage]:
+def filter_untrusted_tool_results(
+    messages: Sequence[AnyMessage],
+    trusted_tool_names: frozenset[str] = frozenset(),
+) -> list[ToolMessage]:
     """Select results needing classification/wrapping without modifying model history."""
     calls: dict[str, ToolCall | None] = {}
     untrusted: list[ToolMessage] = []
@@ -77,7 +91,7 @@ def filter_untrusted_tool_results(messages: Sequence[AnyMessage]) -> list[ToolMe
                 if call_id:
                     calls[call_id] = None if call_id in calls else call
         elif isinstance(message, ToolMessage) and not _is_trusted_tool_result(
-            message, calls.get(message.tool_call_id)
+            message, calls.get(message.tool_call_id), trusted_tool_names
         ):
             untrusted.append(message)
     return untrusted
@@ -101,8 +115,10 @@ class ToolResultInspectionMiddleware(AgentMiddleware[Any, Any, Any]):
         inspector: ToolResultInspector | None = None,
         *,
         on_accepted: Callable[[Sequence[ToolMessage]], None] | None = None,
+        trusted_tool_names: frozenset[str] = frozenset(),
     ) -> None:
         self._inspector = inspector
+        self._trusted_tool_names = trusted_tool_names
         self._on_accepted = on_accepted
         self._classified_signatures: set[tuple[str, str, str, str]] = set()
 
@@ -119,7 +135,8 @@ class ToolResultInspectionMiddleware(AgentMiddleware[Any, Any, Any]):
 
     async def awrap_model_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
         untrusted_results = {
-            id(message) for message in filter_untrusted_tool_results(request.messages)
+            id(message)
+            for message in filter_untrusted_tool_results(request.messages, self._trusted_tool_names)
         }
         for message in request.messages:
             if not isinstance(message, ToolMessage) or self._inspector is None:
