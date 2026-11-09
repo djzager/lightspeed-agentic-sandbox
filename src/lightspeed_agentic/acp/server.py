@@ -22,9 +22,10 @@ from lightspeed_agentic.types import ProviderQueryOptions
 
 
 class RPCError(Exception):
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, code: int, message: str, *, data: Any = None) -> None:
         super().__init__(message)
         self.code = code
+        self.data = data
 
 
 def _prompt(params: dict[str, Any]) -> str:
@@ -50,6 +51,7 @@ class SessionState:
     message_id: str = ""
     history: list[dict[str, Any]] = field(default_factory=list)
     cancel_requested: bool = False
+    is_primary: bool = False
 
 
 class ACPConnection:
@@ -71,6 +73,7 @@ class ACPConnection:
         self.options = options
         self.timeout_seconds = timeout_seconds
         self.initialized = False
+        self.closed = False
         self.sessions = sessions if sessions is not None else {}
         self.pending: dict[str, asyncio.Future[dict[str, Any]]] = {}
         self.tasks: set[asyncio.Task[None]] = set()
@@ -134,6 +137,7 @@ class ACPConnection:
                 self.tasks.add(task)
                 task.add_done_callback(completed)
         finally:
+            self.closed = True
             owned = [state for state in self.sessions.values() if state.owner is self]
             await asyncio.gather(
                 *(state.runtime.cancel() for state in owned), return_exceptions=True
@@ -172,10 +176,13 @@ class ACPConnection:
                 await self.send({"id": request_id, "result": result})
         except RPCError as exc:
             if is_request:
+                error = {"code": exc.code, "message": str(exc)}
+                if exc.data is not None:
+                    error["data"] = exc.data
                 await self.send(
                     {
                         "id": request_id if type(request_id) in (str, int) else None,
-                        "error": {"code": exc.code, "message": str(exc)},
+                        "error": error,
                     }
                 )
         except Exception:
@@ -218,6 +225,17 @@ class ACPConnection:
                 self.config.validate_session(params)
             except ValueError as exc:
                 raise RPCError(-32602, "session configuration rejected") from exc
+            if len(self.sessions) >= 16:
+                expired = next(
+                    (
+                        sid
+                        for sid, state in self.sessions.items()
+                        if not state.is_primary and not state.history and state.owner.closed
+                    ),
+                    None,
+                )
+                if expired is not None:
+                    self.sessions.pop(expired)
             if len(self.sessions) >= 16:
                 raise RPCError(-32000, "session limit reached")
             session_id = uuid4().hex
@@ -266,7 +284,12 @@ class ACPConnection:
                 user_input_callback=user_input if self.config.ask_user else None,
             )
             runtime.mode = self.config.mode
-            self.sessions[session_id] = SessionState(runtime=runtime, owner=self)
+            is_primary = self.config.replay_primary_session and not any(
+                state.is_primary for state in self.sessions.values()
+            )
+            self.sessions[session_id] = SessionState(
+                runtime=runtime, owner=self, is_primary=is_primary
+            )
             return {"sessionId": session_id}
         session_id, state = self.session(params)
         if method == "session/load":
@@ -274,7 +297,13 @@ class ACPConnection:
                 self.config.validate_session(params)
             except ValueError as exc:
                 raise RPCError(-32602, "session configuration rejected") from exc
-            for envelope in list(state.history):
+            replay = state
+            if self.config.replay_primary_session and not state.history and not state.is_primary:
+                replay = next(
+                    (candidate for candidate in self.sessions.values() if candidate.is_primary),
+                    state,
+                )
+            for envelope in list(replay.history):
                 await self.send(envelope)
             return {}
         if state.owner is not self:
@@ -295,9 +324,16 @@ class ACPConnection:
             return {}
         if method == "_goose/unstable/session/steer":
             prompt = _prompt(params)
-            if state.run_id is None or params.get("expectedRunId") != state.run_id:
-                raise RPCError(-32000, "active run does not match")
-            message_id = await state.runtime.steer(prompt)
+            if state.run_id is None:
+                raise RPCError(-32602, "no active run", data="no active run")
+            if params.get("expectedRunId") != state.run_id:
+                raise RPCError(
+                    -32602, "active run does not match", data={"actualRunId": state.run_id}
+                )
+            try:
+                message_id = await state.runtime.steer(prompt)
+            except RuntimeError as exc:
+                raise RPCError(-32602, "no active run", data="no active run") from exc
             return {"runId": state.run_id, "messageId": message_id}
         if method != "session/prompt":
             raise RPCError(-32601, "method not supported")
@@ -329,11 +365,14 @@ class ACPConnection:
                 },
             }
         )
-        await self.update(
-            session_id,
-            {"sessionUpdate": "session_info_update", "_meta": {"goose": {"runId": state.run_id}}},
-        )
         try:
+            await self.update(
+                session_id,
+                {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {"goose": {"runId": state.run_id, "activeRunId": state.run_id}},
+                },
+            )
             async with asyncio.timeout(self.timeout_seconds):
                 stop_reason = await self.consume(session_id, state, prompt, max_turns=max_turns)
                 result: dict[str, Any] = {"stopReason": stop_reason}
@@ -343,6 +382,13 @@ class ACPConnection:
                 return result
         finally:
             state.run_id = None
+            await self.update(
+                session_id,
+                {
+                    "sessionUpdate": "session_info_update",
+                    "_meta": {"goose": {"runId": None, "activeRunId": None}},
+                },
+            )
 
     async def consume(
         self, session_id: str, state: SessionState, prompt: str, *, max_turns: int

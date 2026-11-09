@@ -84,8 +84,10 @@ class FakeSession:
 class FakeProvider:
     def __init__(self):
         self.sessions = []
+        self.options = []
 
     def create_session(self, _options, **callbacks):
+        self.options.append(_options)
         session = FakeSession(**callbacks)
         self.sessions.append(session)
         return session
@@ -93,9 +95,17 @@ class FakeProvider:
 
 @asynccontextmanager
 async def server(
-    tmp_path, *, ask_user=None, timeout_seconds=5, provider_override=None, mode="auto"
+    tmp_path,
+    *,
+    ask_user=None,
+    timeout_seconds=5,
+    provider_override=None,
+    mode="auto",
+    config_overrides=None,
 ):
-    config = ACPConfig(cwd=str(tmp_path), max_turns=7, ask_user=ask_user, mode=mode)
+    config = ACPConfig(
+        cwd=str(tmp_path), max_turns=7, ask_user=ask_user, mode=mode, **(config_overrides or {})
+    )
     options = ProviderQueryOptions(prompt="", system_prompt="rules", max_turns=7, cwd=str(tmp_path))
     provider = provider_override or FakeProvider()
     listening = asyncio.get_running_loop().create_future()

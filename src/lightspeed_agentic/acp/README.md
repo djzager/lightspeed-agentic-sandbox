@@ -12,6 +12,8 @@ The launcher supplies a private JSON configuration file:
 ```json
 {
   "cwd": "/workspace/repo",
+  "cwd_aliases": ["/workspace"],
+  "replay_primary_session": true,
   "system_prompt": "You are an AI agent.",
   "max_turns": 200,
   "mode": "approve",
@@ -19,7 +21,10 @@ The launcher supplies a private JSON configuration file:
 }
 ```
 
-`cwd` must identify an existing absolute directory. `max_turns` is required and
+`cwd` must identify an existing absolute directory. Optional `cwd_aliases` are
+explicit launcher-owned logical client paths, for example the UI's `/workspace`.
+They default to empty and never change the execution directory or expose another
+filesystem root. Unknown paths remain rejected. `max_turns` is required and
 positive. `system_prompt` defaults to a generic instruction; `mode` defaults to
 `auto`; `ask_user` is optional. An `approve` launcher policy cannot be reduced
 through `session/set_mode`. Normal Lightspeed provider, TLS, reasoning, inspection,
@@ -37,11 +42,25 @@ Supported methods are `initialize`, `session/new`, `session/prompt`,
 `session/cancel`, `session/set_mode`, and `session/load`. Text prompts only.
 Multiple prompts share the same in-memory runtime/checkpointer. Load replays
 normalized, inspected history across viewer connections while the process lives;
-there is no restart persistence. Only the creating connection may execute or
+there is no restart persistence. The optional `replay_primary_session` setting
+defaults to false. When enabled, the first successfully created session is the
+launcher's primary session; the launcher must create it before exposing any
+viewer transport. The harness enforces this by creating its session before
+starting its tee. Loading a silent viewer session then replays only that primary
+session's inspected history with its original session IDs. Other prompted
+sessions retain their own history and are never combined. Closed silent viewer
+sessions can be evicted when the session limit is reached; the UI falls back to
+creating a new viewer session if an old one was evicted.
+Only the creating connection may execute or
 cancel a session. Viewer steering uses the harness-compatible
 `_goose/unstable/session/steer` request with `expectedRunId`; accepted guidance
 enters the conversation at the next main-model boundary. Run/message metadata
-uses `_meta.goose` for existing UI compatibility. Terminal model-turn count is
+uses `_meta.goose` for existing UI compatibility. A `session_info_update` announces
+`activeRunId` at prompt start and clears it to null on every completion, error,
+timeout, or cancellation path. The existing `runId` alias remains available.
+A stale or discovery steering request is rejected with `-32602` and
+`error.data.actualRunId`; no active run returns `-32602` with a data string
+containing `no active run`. Neither case queues guidance. Terminal model-turn count is
 reported as `_meta.lightspeed.turnsUsed` in the prompt response.
 The owner can reduce an individual prompt's budget with
 `_meta.lightspeed.maxTurns`, a strictly positive integer clamped to the configured
