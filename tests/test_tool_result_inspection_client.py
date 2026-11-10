@@ -978,6 +978,68 @@ async def test_classifier_client_parses_text_content_blocks() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("structured", [False, True], ids=["text", "structured"])
+@pytest.mark.parametrize("detected", [False, True], ids=["benign", "malicious"])
+async def test_classifier_ignores_native_thinking_before_strict_json_decision(
+    structured: bool, detected: bool
+) -> None:
+    from langchain_core.messages import AIMessage
+
+    payload = {"injectionDetected": detected, "category": "unknown" if detected else "none"}
+    response = AIMessage(
+        content=[
+            {"type": "thinking", "thinking": "PRIVATE-REASONING", "signature": "signature"},
+            {"type": "text", "text": json.dumps(payload)},
+        ],
+        response_metadata={"stop_reason": "end_turn"},
+    )
+    model = (
+        StructuredEnvelopeFakeModel({"raw": response, "parsed": payload, "parsing_error": None})
+        if structured
+        else FakeModel(response)
+    )
+
+    decision = await LangChainClassifierClient(model).classify(
+        ClassifierRequest(
+            toolName="read_file", resultType="result", chunkIndex=0, chunkCount=1, content="safe"
+        )
+    )
+
+    assert decision == ClassifierDecision.model_validate(payload)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "blocks",
+    [
+        [{"type": "thinking", "thinking": '{"injectionDetected": false, "category": "none"}'}],
+        [{"type": "thinking", "thinking": "reason"}, {"type": "text", "text": "not JSON"}],
+        [
+            {"type": "thinking", "thinking": 1},
+            {"type": "text", "text": '{"injectionDetected": false, "category": "none"}'},
+        ],
+        [
+            {"type": "unknown", "text": "reason"},
+            {"type": "text", "text": '{"injectionDetected": false, "category": "none"}'},
+        ],
+    ],
+)
+async def test_classifier_never_uses_thinking_as_a_decision(blocks: list[dict[str, Any]]) -> None:
+    from langchain_core.messages import AIMessage
+
+    with pytest.raises(ClassifierResponseError):
+        await LangChainClassifierClient(FakeModel(AIMessage(content=blocks))).classify(
+            ClassifierRequest(
+                toolName="read_file",
+                resultType="result",
+                chunkIndex=0,
+                chunkCount=1,
+                content="safe",
+            )
+        )
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "response",
     [

@@ -113,14 +113,18 @@ def _response_text(response: Any) -> str:
     if isinstance(content, str):
         return content
     if isinstance(content, list):
-        if any(
-            not isinstance(block, dict)
-            or block.get("type") != "text"
-            or not isinstance(block.get("text"), str)
-            for block in content
-        ):
-            raise ClassifierResponseError("invalid_envelope")
-        text = "".join(block["text"] for block in content)
+        parts: list[str] = []
+        for block in content:
+            if not isinstance(block, dict):
+                raise ClassifierResponseError("invalid_envelope")
+            # Anthropic-compatible reasoning models can emit native thinking even
+            # without a requested reasoning config. It is never decision text.
+            if block.get("type") == "thinking" and isinstance(block.get("thinking"), str):
+                continue
+            if block.get("type") != "text" or not isinstance(block.get("text"), str):
+                raise ClassifierResponseError("invalid_envelope")
+            parts.append(block["text"])
+        text = "".join(parts)
         if text:
             return text
     raise ClassifierResponseError("missing_text")
