@@ -680,7 +680,10 @@ async def test_close_model_clients_closes_only_initialized_clients() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("reasoning", [None, {"thinking": {"type": "adaptive"}}])
+@pytest.mark.parametrize(
+    "reasoning",
+    [None, {"thinking": {"type": "adaptive"}}, {"thinking": {"type": "enabled"}, "effort": "low"}],
+)
 @pytest.mark.parametrize(
     ("route_id", "telemetry_provider", "method"),
     [

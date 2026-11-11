@@ -1230,3 +1230,94 @@ async def test_native_thinking_only_output_cutoff_fails_real_session(
             assert requests[0]["max_tokens"] == 16384
             assert requests[0]["stream"] is True
             await session.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hosting", ["direct", "bedrock", "vertex"])
+@pytest.mark.parametrize(
+    "reasoning_config",
+    [
+        {"thinking": {"type": "enabled"}, "effort": "low"},
+        {"thinking": {"type": "enabled"}, "output_config": {"effort": "low"}},
+        {"thinking": {"type": "enabled"}, "effort": "low", "output_config": {"effort": "high"}},
+        {"effort": "low"},
+    ],
+)
+async def test_anthropic_reasoning_effort_reaches_native_request(
+    monkeypatch: pytest.MonkeyPatch, hosting: str, reasoning_config: dict[str, Any]
+) -> None:
+    from copy import deepcopy
+
+    from lightspeed_agentic.config import (
+        AnthropicCredentialSource,
+        BedrockCredentialSource,
+        BedrockProviderParameters,
+        ModelParameters,
+        VertexCredentialSource,
+        VertexProviderParameters,
+    )
+    from lightspeed_agentic.providers.models import anthropic as models
+
+    original = deepcopy(reasoning_config)
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "id": "msg_test",
+                "type": "message",
+                "role": "assistant",
+                "model": "compatible-model",
+                "content": [{"type": "text", "text": "OK"}],
+                "stop_reason": "end_turn",
+                "stop_sequence": None,
+                "usage": {"input_tokens": 1, "output_tokens": 1},
+            },
+        )
+
+    transport = httpx.MockTransport(respond)
+    with httpx.Client(transport=transport) as sync_client:
+        async with httpx.AsyncClient(transport=transport) as async_client:
+            monkeypatch.setattr(tls, "create_http_client", lambda: sync_client)
+            monkeypatch.setattr(tls, "create_async_http_client", lambda: async_client)
+            if hosting == "direct":
+                model = models.create_direct_model(
+                    ModelParameters(
+                        model="compatible-model",
+                        credentials=AnthropicCredentialSource(api_key="test-key"),
+                    ),
+                    reasoning_config,
+                )
+            elif hosting == "bedrock":
+                model = models.create_bedrock_model(
+                    ModelParameters(
+                        model="global.anthropic.claude-haiku-4-5-20251001-v1:0",
+                        provider=BedrockProviderParameters(region="us-west-2"),
+                        credentials=BedrockCredentialSource(
+                            access_key_id="test-access-key",
+                            secret_access_key="test-secret-key",  # noqa: S106 -- offline test credential
+                        ),
+                    ),
+                    reasoning_config,
+                )
+            else:
+                model = models.create_vertex_model(
+                    ModelParameters(
+                        model="claude-sonnet-4-6@20260217",
+                        provider=VertexProviderParameters(
+                            project="test-project", region="us-east5"
+                        ),
+                        credentials=VertexCredentialSource(Path("/unused/credentials.json")),
+                    ),
+                    reasoning_config,
+                )
+                model.async_client.access_token = "test-token"  # noqa: S105 -- offline test credential
+            assert (await model.ainvoke("Reply OK")).content
+    assert len(requests) == 1
+    assert requests[0]["output_config"]["effort"] == "low"
+    assert requests[0].get("thinking") == reasoning_config.get("thinking")
+    assert "effort" not in requests[0]
+    assert "reasoning_effort" not in requests[0]
+    assert reasoning_config == original

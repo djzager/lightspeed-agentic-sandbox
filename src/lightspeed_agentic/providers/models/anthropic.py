@@ -17,6 +17,25 @@ if TYPE_CHECKING:
     from lightspeed_agentic.config import ModelParameters
 
 
+def _reasoning_kwargs(reasoning_config: dict[str, Any] | None) -> dict[str, Any]:
+    """Normalize effort without enabling or disabling a model's thinking mode."""
+    if reasoning_config is None:
+        return {}
+    kwargs: dict[str, Any] = {
+        name: reasoning_config[name]
+        for name in ("thinking", "output_config")
+        if name in reasoning_config
+    }
+    if "effort" in reasoning_config:
+        output_config = kwargs.get("output_config")
+        if output_config is None:
+            output_config = {}
+        if not isinstance(output_config, dict):
+            raise ValueError("output_config must be an object when combined with effort")
+        kwargs["output_config"] = {**output_config, "effort": reasoning_config["effort"]}
+    return kwargs
+
+
 def _tls_model_class(
     model_class: Any,
     client_class: Any,
@@ -66,9 +85,7 @@ def create_direct_model(
         kwargs["base_url"] = parameters.base_url
     if parameters.max_output_tokens is not None:
         kwargs["max_tokens"] = parameters.max_output_tokens
-    thinking = reasoning_config.get("thinking") if reasoning_config else None
-    if thinking:
-        kwargs["thinking"] = thinking
+    kwargs.update(_reasoning_kwargs(reasoning_config))
     if credential_source.auth_token:
         kwargs["default_headers"] = {"Authorization": f"Bearer {credential_source.auth_token}"}
     return model_class(**kwargs)
@@ -113,9 +130,7 @@ def create_bedrock_model(
     }
     if parameters.max_output_tokens is not None:
         kwargs["max_tokens"] = parameters.max_output_tokens
-    thinking = reasoning_config.get("thinking") if reasoning_config else None
-    if thinking:
-        kwargs["thinking"] = thinking
+    kwargs.update(_reasoning_kwargs(reasoning_config))
     return model_class(**kwargs)
 
 
@@ -216,7 +231,7 @@ def create_vertex_model(
         if endpoint.path in ("", "/"):
             endpoint = endpoint._replace(path="/v1")
         kwargs["base_url"] = endpoint.geturl()
-    thinking = reasoning_config.get("thinking") if reasoning_config else None
-    if thinking:
-        kwargs["thinking"] = thinking
+    reasoning = _reasoning_kwargs(reasoning_config)
+    if reasoning:
+        kwargs["model_kwargs"] = reasoning
     return ChatAnthropicVertex(**kwargs)

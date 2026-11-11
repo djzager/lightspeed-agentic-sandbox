@@ -131,3 +131,11 @@ A provider-reported output cutoff fails the active prompt through ACP's existing
 runtime-operation error. Its observed usage remains available, and a subsequent
 explicit prompt can continue the same in-memory session. The adapter does not
 automatically repeat a costly or truncated request.
+
+For Anthropic-compatible models that support effort controls, an explicit setting
+such as `LIGHTSPEED_REASONING_CONFIG='{"thinking":{"type":"enabled"},"effort":"low"}'`
+keeps thinking enabled and maps effort to the native `output_config.effort` field.
+The native `output_config` form is also accepted; normalized `effort` takes
+precedence when both are supplied. No effort or thinking default is imposed, and
+model/API support remains provider-specific. This configuration applies to the
+agent pass; classifier and shaping calls keep reasoning unconfigured.
