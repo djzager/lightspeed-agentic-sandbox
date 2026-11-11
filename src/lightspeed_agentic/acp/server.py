@@ -1,7 +1,7 @@
-"""ACP v1 JSON-RPC over the harness's authenticated local WebSocket transport.
+"""Authenticated local WebSocket transport and launcher policy for official ACP.
 
-Only normalized runtime events cross this boundary. In particular, raw graph
-messages and uninspected tool results must never be streamed here.
+The official server renders native graph frames through Lightspeed's inspection
+output gate. Same-process viewers replay authorized updates and user prompts.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import hmac
 import json
+from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from http import HTTPStatus
@@ -52,10 +53,15 @@ class SessionState:
     history: list[dict[str, Any]] = field(default_factory=list)
     cancel_requested: bool = False
     is_primary: bool = False
+    graph: Any = None
+    history_bytes: int = 0
+    history_truncated: bool = False
 
 
 class ACPConnection:
-    """One reader demultiplexes replies while prompt/cancel/asks run concurrently."""
+    """Authenticated WebSocket framing and launcher policy around official ACP."""
+
+    MAX_HISTORY_BYTES = 16 * 1024 * 1024
 
     def __init__(
         self,
@@ -79,6 +85,12 @@ class ACPConnection:
         self.tasks: set[asyncio.Task[None]] = set()
         self.request_ids: set[str | int] = set()
         self.send_lock = asyncio.Lock()
+        from acp.agent.router import build_agent_router
+
+        from lightspeed_agentic.acp.official import LightspeedACPServer
+
+        self.agent = LightspeedACPServer(self)
+        self.router = build_agent_router(self.agent)
 
     async def send(self, message: dict[str, Any]) -> None:
         async with self.send_lock:
@@ -88,8 +100,18 @@ class ACPConnection:
         self, session_id: str, update: dict[str, Any], *, method: str = "session/update"
     ) -> None:
         envelope = {"method": method, "params": {"sessionId": session_id, "update": update}}
-        self.sessions[session_id].history.append(envelope)
+        self.record(session_id, envelope)
         await self.send(envelope)
+
+    def record(self, session_id: str, envelope: dict[str, Any]) -> None:
+        """Retain a bounded authorized viewer tail, including incoming user prompts."""
+        state = self.sessions[session_id]
+        state.history.append(envelope)
+        state.history_bytes += len(json.dumps(envelope, allow_nan=False).encode("utf-8"))
+        while state.history_bytes > self.MAX_HISTORY_BYTES and state.history:
+            removed = state.history.pop(0)
+            state.history_bytes -= len(json.dumps(removed, allow_nan=False).encode("utf-8"))
+            state.history_truncated = True
 
     async def call(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         request_id = "lightspeed-" + uuid4().hex
@@ -151,6 +173,9 @@ class ACPConnection:
             await asyncio.gather(
                 *(state.runtime.aclose() for state in owned), return_exceptions=True
             )
+            for state in owned:
+                state.graph = None
+            self.agent._agent = None
 
     async def dispatch(self, frame: dict[str, Any]) -> None:
         request_id = frame.get("id")
@@ -171,7 +196,11 @@ class ACPConnection:
                 raise RPCError(-32602, "invalid method parameters")
             if not is_request and method != "session/cancel":
                 return
-            result = await self.handle(method, params)
+            if method == "initialize" and type(params.get("protocolVersion")) is not int:
+                raise RPCError(-32602, "ACP protocol version 1 required")
+            result = await self.router(method, params, not is_request)
+            if hasattr(result, "model_dump"):
+                result = result.model_dump(by_alias=True, exclude_none=True)
             if is_request:
                 await self.send({"id": request_id, "result": result})
         except RPCError as exc:
@@ -185,13 +214,21 @@ class ACPConnection:
                         "error": error,
                     }
                 )
-        except Exception:
+        except Exception as exc:
+            from acp.exceptions import RequestError
+            from pydantic import ValidationError
+
+            code = (
+                exc.code
+                if isinstance(exc, RequestError)
+                else (-32602 if isinstance(exc, ValidationError) else -32603)
+            )
             # Model, subprocess, and validation exceptions can contain secrets/content.
             if is_request:
                 await self.send(
                     {
                         "id": request_id,
-                        "error": {"code": -32603, "message": "runtime operation failed"},
+                        "error": {"code": code, "message": "runtime operation failed"},
                     }
                 )
         finally:
@@ -208,16 +245,20 @@ class ACPConnection:
         if method == "initialize":
             if type(params.get("protocolVersion")) is not int or params["protocolVersion"] != 1:
                 raise RPCError(-32602, "ACP protocol version 1 required")
+            from deepagents_acp.server import AgentServerACP
+
+            response = await AgentServerACP.initialize(self.agent, protocol_version=1)
+            # SDK 0.10.1 defaults this optional model field to an untyped dict.
+            # The host authenticates its WebSocket and exposes no ACP auth method.
+            if response.agent_capabilities is not None:
+                response.agent_capabilities.auth = None
+            initialization = response.model_dump(by_alias=True, exclude_none=True)
+            initialization["agentInfo"] = {"name": "lightspeed-agentic", "version": "0.1.0"}
+            # The host admits text only and launcher-owned MCP configuration.
+            initialization["agentCapabilities"]["promptCapabilities"] = {}
+            initialization["agentCapabilities"]["mcpCapabilities"] = {}
             self.initialized = True
-            return {
-                "protocolVersion": 1,
-                "agentInfo": {"name": "lightspeed-agentic", "version": "0.1.0"},
-                "agentCapabilities": {
-                    "loadSession": True,
-                    "promptCapabilities": {},
-                    "mcpCapabilities": {},
-                },
-            }
+            return initialization
         if not self.initialized:
             raise RPCError(-32000, "initialize required")
         if method == "session/new":
@@ -238,7 +279,12 @@ class ACPConnection:
                     self.sessions.pop(expired)
             if len(self.sessions) >= 16:
                 raise RPCError(-32000, "session limit reached")
-            session_id = uuid4().hex
+            from deepagents_acp.server import AgentServerACP
+
+            created = await AgentServerACP.new_session(
+                self.agent, cwd=self.config.cwd, mcp_servers=[]
+            )
+            session_id = created.session_id
 
             async def permission(request: Any) -> bool:
                 reply = await self.call(
@@ -297,14 +343,7 @@ class ACPConnection:
                 self.config.validate_session(params)
             except ValueError as exc:
                 raise RPCError(-32602, "session configuration rejected") from exc
-            replay = state
-            if self.config.replay_primary_session and not state.history and not state.is_primary:
-                replay = next(
-                    (candidate for candidate in self.sessions.values() if candidate.is_primary),
-                    state,
-                )
-            for envelope in list(replay.history):
-                await self.send(envelope)
+            await self.agent._replay_session(session_id, state.graph)
             return {}
         if state.owner is not self:
             raise RPCError(-32000, "session belongs to another connection")
@@ -352,7 +391,8 @@ class ACPConnection:
             raise RPCError(-32000, "session already has an active prompt")
         state.run_id, state.message_id = uuid4().hex, uuid4().hex
         state.cancel_requested = False
-        state.history.append(
+        self.record(
+            session_id,
             {
                 "method": "session/update",
                 "params": {
@@ -363,7 +403,7 @@ class ACPConnection:
                         "_meta": {"goose": {"messageId": uuid4().hex}},
                     },
                 },
-            }
+            },
         )
         try:
             await self.update(
@@ -393,81 +433,121 @@ class ACPConnection:
     async def consume(
         self, session_id: str, state: SessionState, prompt: str, *, max_turns: int
     ) -> str:
+        from acp import text_block
+        from deepagents_acp.server import AgentServerACP
+        from langgraph.errors import GraphRecursionError
+        from opentelemetry import context as otel_context
+
+        from lightspeed_agentic.acp.runtime_graph import InspectedGraph
+        from lightspeed_agentic.providers.deepagents import _create_generation_callback
+        from lightspeed_agentic.session import SessionTurnLimitError
+        from lightspeed_agentic.types import ResultEvent
+
         if state.cancel_requested:
             return "cancelled"
-        stop_reason = "end_turn"
-        async for event in state.runtime.prompt(prompt, max_turns=max_turns):
-            kind = event.type
-            if kind == "user_message":
-                state.message_id = uuid4().hex
-                await self.update(
-                    session_id,
-                    {
-                        "sessionUpdate": "user_message_chunk",
-                        "content": {"type": "text", "text": event.text},
-                        "_meta": {
-                            "goose": {
-                                "runId": state.run_id,
-                                "messageId": event.message_id,
-                                "steer": True,
-                            }
-                        },
-                    },
+        runtime = state.runtime
+        events: deque[Any] = deque()
+        graph: Any = None
+        reason = "end_turn"
+        async with runtime.graph_execution(max_turns, events.append):
+            try:
+                native_graph = await runtime.prepare_graph()
+                graph = state.graph = InspectedGraph(
+                    native_graph,
+                    runtime,
+                    lambda event: self.publish_event(session_id, state, event),
                 )
-            elif kind in ("text_delta", "thinking_delta"):
-                text = event.text if kind == "text_delta" else event.thinking
-                await self.update(
-                    session_id,
-                    {
-                        "sessionUpdate": "agent_message_chunk"
-                        if kind == "text_delta"
-                        else "agent_thought_chunk",
-                        "content": {"type": "text", "text": text},
-                        "_meta": {"goose": {"messageId": state.message_id}},
-                    },
+                graph.events = events
+                graph.callback = _create_generation_callback(
+                    self.provider._model_route,
+                    otel_context.get_current(),
+                    main_name=None,
+                    usage_observer=runtime._observe_usage,
                 )
-            elif kind == "tool_call":
-                await self.update(
-                    session_id,
-                    {
-                        "sessionUpdate": "tool_call",
-                        "toolCallId": event.call_id,
-                        "title": event.name,
-                        "kind": "other",
-                        "status": "in_progress",
-                        "rawInput": event.input,
-                    },
+                self.agent._reset_agent(session_id)
+                while True:
+                    await AgentServerACP.prompt(
+                        self.agent, [text_block(prompt)], session_id=session_id
+                    )
+                    if not runtime._steering:
+                        # No await between the final boundary check and closing
+                        # admission: accepted guidance cannot disappear in cleanup.
+                        runtime._accepting_steering = False
+                        break
+                    prompt = "\n\n".join(message.content for message in runtime._take_steering())
+                    await graph.flush_events()
+                if runtime._options.output_schema:
+                    from lightspeed_agentic.providers.deepagents import _shape_structured_output
+
+                    await _shape_structured_output(
+                        self.provider._model_route,
+                        runtime._resources["schema_model"],
+                        runtime._options.system_prompt,
+                        prompt,
+                        graph.result_text,
+                        graph.callback,
+                        prepared_schema=runtime._resources["prepared_schema"],
+                    )
+            except BaseException as exc:
+                runtime._accepting_steering = False
+                if isinstance(exc, asyncio.CancelledError) or runtime._cancel_requested:
+                    reason = "cancelled"
+                elif isinstance(exc, (SessionTurnLimitError, GraphRecursionError)):
+                    reason = "max_turn_requests"
+                else:
+                    raise
+                try:
+                    await runtime._finish_unanswered_tools(reason)
+                except Exception:
+                    runtime._closed = True
+                    raise
+                if isinstance(exc, asyncio.CancelledError) and not runtime._cancel_requested:
+                    raise
+            finally:
+                # The execution is terminal before writing notifications. Late
+                # cancel/steer requests cannot cancel the prompt response itself.
+                runtime._active = None
+                runtime._accepting_steering = False
+                if graph is not None:
+                    graph.callback.close_open("generation_interrupted")
+                    await graph.flush_events()
+                await self.publish_event(
+                    session_id, state, ResultEvent(turns_used=runtime.turns_used)
                 )
-            elif kind == "tool_result":
-                await self.update(
-                    session_id,
-                    {
-                        "sessionUpdate": "tool_call_update",
-                        "toolCallId": event.call_id,
-                        "status": "failed" if event.error_type else "completed",
-                        "content": [
-                            {"type": "content", "content": {"type": "text", "text": event.output}}
-                        ],
+        return reason
+
+    async def publish_event(self, session_id: str, state: SessionState, event: Any) -> None:
+        """Lightspeed extensions; standard message/tool formatting belongs to ACP."""
+        if event.type == "user_message":
+            state.message_id = uuid4().hex
+            await self.update(
+                session_id,
+                {
+                    "sessionUpdate": "user_message_chunk",
+                    "content": {"type": "text", "text": event.text},
+                    "_meta": {
+                        "goose": {
+                            "runId": state.run_id,
+                            "messageId": event.message_id,
+                            "steer": True,
+                        }
                     },
-                )
-            elif kind in ("usage", "usage_update", "result"):
-                usage = event.usage if kind == "usage" else state.runtime.usage
-                update: dict[str, Any] = {"sessionUpdate": "usage_update"}
-                for source, target in (
-                    ("input_tokens", "inputTokens"),
-                    ("output_tokens", "outputTokens"),
-                ):
-                    value = getattr(usage, source, None)
-                    if type(value) is int and value >= 0:
-                        update[target] = value
-                turns = getattr(event, "turns_used", None)
-                if type(turns) is int and turns >= 0:
-                    update["_meta"] = {"lightspeed": {"turnsUsed": turns}}
-                await self.update(session_id, update, method="_lightspeed/session/update")
-                if kind == "result":
-                    reason = getattr(event, "stop_reason", "end_turn")
-                    stop_reason = "max_turn_requests" if reason == "max_turns" else reason
-        return stop_reason
+                },
+            )
+        elif event.type in ("usage", "result"):
+            usage = event.usage if event.type == "usage" else state.runtime.usage
+            update: dict[str, Any] = {"sessionUpdate": "usage_update"}
+            for source, target in (
+                ("input_tokens", "inputTokens"),
+                ("output_tokens", "outputTokens"),
+            ):
+                value = getattr(usage, source, None)
+                if type(value) is int and value >= 0:
+                    update[target] = value
+            turns = getattr(event, "turns_used", None)
+            if type(turns) is int and turns >= 0:
+                update["_meta"] = {"lightspeed": {"turnsUsed": turns}}
+            await self.update(session_id, update, method="_lightspeed/session/update")
 
 
 async def serve(

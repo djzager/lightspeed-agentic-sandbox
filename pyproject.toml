@@ -24,7 +24,12 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-acp = ["websockets>=15.0.1,<17"]
+acp = [
+    "websockets>=15.0.1,<17",
+    "deepagents==0.7.22",
+    "agent-client-protocol==0.10.1",
+    "deepagents-acp @ git+https://github.com/langchain-ai/deepagents.git@f2a6e02dc8e2dcb05885c5133b94102ccc79b794#subdirectory=libs/acp",
+]
 deepagents = [
     "anthropic<1",
     "botocore>=1.31.57,<2",
@@ -58,7 +63,7 @@ dev = [
     "mypy>=1.20.2",
     "ruff>=0.15.12",
     "tomlkit>=0.14.0",
-    "lightspeed-agentic[all]",
+    "lightspeed-agentic[all,acp]",
 ]
 e2e = [
     "pytest>=9.0.3",
@@ -79,6 +84,9 @@ omit = [".venv/*"]
 precision = 2
 
 [tool.uv]
+# Resolve published dependency metadata, not the pinned ACP repository's
+# development-workspace mapping to a different DeepAgents implementation.
+no-sources = true
 constraint-dependencies = [
     "PyJWT>=2.14.0",
     "anyio>=4.14.2",
@@ -89,6 +97,9 @@ constraint-dependencies = [
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/lightspeed_agentic"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.ruff]
 line-length = 100

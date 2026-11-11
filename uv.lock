@@ -18,6 +18,18 @@ constraints = [
 ]
 
 [[package]]
+name = "agent-client-protocol"
+version = "0.10.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydantic" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/88/a0/3b96cd8374725c69bc3dae9fcc2082f3f6cafec1be35d24d7af0f8c3265f/agent_client_protocol-0.10.1.tar.gz", hash = "sha256:355c65ca19f0568344aafc2c1552b7066a8fc491df23ab28e7e253c6c9a85a25", size = 81924, upload-time = "2026-05-24T18:46:44.444Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/7b/18/d8c7ff337cf621ea79a84006a7252ff057bfb5767549bb102cc6649f4ec2/agent_client_protocol-0.10.1-py3-none-any.whl", hash = "sha256:a03d3198f4d772f2e0ec012c00ac1cce131b4710220a3dc9fae3c991d047c750", size = 65401, upload-time = "2026-05-24T18:46:43.202Z" },
+]
+
+[[package]]
 name = "aiohappyeyeballs"
 version = "2.7.1"
 source = { registry = "https://pypi.org/simple" }
@@ -840,6 +852,16 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/13/28/517fd5fd731e6a7c659aa31218e567ff2f766aca6c075c1086fbf5595f31/deepagents-0.7.22.tar.gz", hash = "sha256:002203b62a6f535914757e198721c003792def37c065b3dd95ce2ba2ae7a919a", size = 322350, upload-time = "2026-10-05T14:07:41.167Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d1/8b/18ecba94780bb1f6e4733a60b23b9290225144c2004273de118995d80fb3/deepagents-0.7.22-py3-none-any.whl", hash = "sha256:c6f59bfadddf411ce0856a2cf16d82be3ea736285420db6c0005b87992a1cbef", size = 351620, upload-time = "2026-10-05T14:07:39.616Z" },
+]
+
+[[package]]
+name = "deepagents-acp"
+version = "0.0.13"
+source = { git = "https://github.com/langchain-ai/deepagents.git?subdirectory=libs%2Facp&rev=f2a6e02dc8e2dcb05885c5133b94102ccc79b794#f2a6e02dc8e2dcb05885c5133b94102ccc79b794" }
+dependencies = [
+    { name = "agent-client-protocol" },
+    { name = "deepagents" },
+    { name = "python-dotenv" },
 ]
 
 [[package]]
@@ -1906,6 +1928,9 @@ dependencies = [
 
 [package.optional-dependencies]
 acp = [
+    { name = "agent-client-protocol" },
+    { name = "deepagents" },
+    { name = "deepagents-acp" },
     { name = "websockets" },
 ]
 all = [
@@ -1944,12 +1969,14 @@ deepagents = [
     { name = "referencing" },
 ]
 dev = [
+    { name = "agent-client-protocol" },
     { name = "aiohttp" },
     { name = "anthropic" },
     { name = "azure-core" },
     { name = "azure-identity" },
     { name = "botocore" },
     { name = "deepagents" },
+    { name = "deepagents-acp" },
     { name = "google-auth" },
     { name = "jsonschema" },
     { name = "langchain" },
@@ -1970,6 +1997,7 @@ dev = [
     { name = "referencing" },
     { name = "ruff" },
     { name = "tomlkit" },
+    { name = "websockets" },
 ]
 e2e = [
     { name = "jsonschema" },
@@ -2004,12 +2032,15 @@ openai = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agent-client-protocol", marker = "extra == 'acp'", specifier = "==0.10.1" },
     { name = "aiohttp", marker = "extra == 'openai'", specifier = "<4" },
     { name = "anthropic", marker = "extra == 'deepagents'", specifier = "<1" },
     { name = "azure-core", marker = "extra == 'openai'", specifier = ">=1.31.0" },
     { name = "azure-identity", marker = "extra == 'openai'", specifier = ">=1.21.0" },
     { name = "botocore", marker = "extra == 'deepagents'", specifier = ">=1.31.57,<2" },
+    { name = "deepagents", marker = "extra == 'acp'", specifier = "==0.7.22" },
     { name = "deepagents", marker = "extra == 'deepagents'", specifier = ">=0.7.18" },
+    { name = "deepagents-acp", marker = "extra == 'acp'", git = "https://github.com/langchain-ai/deepagents.git?subdirectory=libs%2Facp&rev=f2a6e02dc8e2dcb05885c5133b94102ccc79b794" },
     { name = "google-auth", marker = "extra == 'deepagents'", specifier = ">=2,<3" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jsonschema", marker = "extra == 'deepagents'", specifier = ">=4.26.0" },
@@ -2023,7 +2054,7 @@ requires-dist = [
     { name = "langchain-google-vertexai", marker = "extra == 'deepagents'", specifier = ">=3.2.5" },
     { name = "langchain-mcp-adapters", marker = "extra == 'deepagents'", specifier = ">=0.3.0" },
     { name = "langchain-openai", marker = "extra == 'openai'", specifier = ">=1.7.2" },
-    { name = "lightspeed-agentic", extras = ["all"], marker = "extra == 'dev'" },
+    { name = "lightspeed-agentic", extras = ["all", "acp"], marker = "extra == 'dev'" },
     { name = "lightspeed-agentic", extras = ["deepagents"], marker = "extra == 'openai'" },
     { name = "lightspeed-agentic", extras = ["deepagents", "openai"], marker = "extra == 'all'" },
     { name = "mcp", marker = "extra == 'e2e'", specifier = ">=1.24.0,<2" },

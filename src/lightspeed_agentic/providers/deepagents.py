@@ -708,14 +708,17 @@ class DeepAgentsProvider(AgentProvider):
         async for event in self._query(options):
             yield event
 
-    async def _query(
+    async def prepare_graph(
         self,
         options: ProviderQueryOptions,
         *,
         session: RuntimeSession | None = None,
-    ) -> AsyncIterator[ProviderEvent]:
-        parent_context = otel_context.get_current()
+    ) -> dict[str, Any]:
+        """Prepare the native graph and owned clients, without invoking the model.
 
+        Shared by batch/session streaming and the optional official ACP adapter.
+        The caller owns cleanup; failed construction closes clients here.
+        """
         from deepagents import create_deep_agent
         from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend
 
@@ -775,7 +778,6 @@ class DeepAgentsProvider(AgentProvider):
                 options.reasoning_config,
             )
         )
-        generation_callback: Any | None = None
         try:
             if session is None or not session._resources:
                 backend_class = LocalShellBackend
@@ -1020,6 +1022,39 @@ class DeepAgentsProvider(AgentProvider):
                 agent = session._resources["agent"]
                 classifier_model = session._resources["classifier_model"]
                 inspection_middleware = session._resources["inspection_middleware"]
+            return {
+                "agent": agent,
+                "chat_model": chat_model,
+                "classifier_model": classifier_model,
+                "inspection_middleware": inspection_middleware,
+                "schema_model": schema_model,
+                "prepared_schema": prepared_schema,
+            }
+        except BaseException:
+            if session is None or not session._resources:
+                await _close_model_clients(chat_model)
+                if classifier_model is not None:
+                    await _close_model_clients(classifier_model)
+            raise
+
+    async def _query(
+        self,
+        options: ProviderQueryOptions,
+        *,
+        session: RuntimeSession | None = None,
+    ) -> AsyncIterator[ProviderEvent]:
+        parent_context = otel_context.get_current()
+        from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
+
+        prepared = await self.prepare_graph(options, session=session)
+        agent = prepared["agent"]
+        chat_model = prepared["chat_model"]
+        classifier_model = prepared["classifier_model"]
+        inspection_middleware = prepared["inspection_middleware"]
+        schema_model = prepared["schema_model"]
+        prepared_schema = prepared["prepared_schema"]
+        generation_callback: Any | None = None
+        try:
             generation_callback = _create_generation_callback(
                 self._model_route,
                 parent_context,

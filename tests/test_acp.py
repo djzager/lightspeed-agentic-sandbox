@@ -17,19 +17,19 @@ from lightspeed_agentic.acp.server import serve
 from lightspeed_agentic.session import RuntimeSession, ToolPermissionRequest, UserInputRequest
 from lightspeed_agentic.types import (
     ProviderQueryOptions,
-    ResultEvent,
-    TextDeltaEvent,
-    ToolCallEvent,
-    ToolResultEvent,
     UsageEvent,
     UsageSnapshot,
+    UserMessageEvent,
 )
 
 pytestmark = pytest.mark.asyncio
 
 
-class FakeSession:
-    def __init__(self, **callbacks):
+class FakeSession(RuntimeSession):
+    """Real session lifecycle with a deterministic native transport-test graph."""
+
+    def __init__(self, provider, options, **callbacks):
+        super().__init__(provider, options, **callbacks)
         self.callbacks = callbacks
         self.cancelled = asyncio.Event()
         self.steering = asyncio.Queue()
@@ -37,38 +37,17 @@ class FakeSession:
         self.prompts = []
         self.mode = "auto"
         self.closed = False
+        self.graph = FakeGraph(self)
+        self.prepare_calls = 0
+        self.pending_input = None
 
-    async def prompt(self, prompt, *, max_turns):
-        self.prompts.append((prompt, max_turns))
-        self.cancelled.clear()
-        if prompt == "secret failure":
-            raise RuntimeError("credential-supersecret model-content-supersecret")
-        if prompt in ("wait", "steer"):
-            yield ToolCallEvent(name="execute", input='{"command":"safe"}', call_id="call-1")
-            if prompt == "wait":
-                await self.cancelled.wait()
-                yield ResultEvent(stop_reason="cancelled")
-                return
-            guidance, message_id = await self.steering.get()
-            yield SimpleNamespace(type="user_message", text=guidance, message_id=message_id)
-            yield TextDeltaEvent(text=guidance)
-        elif prompt == "approve":
-            allowed = await self.callbacks["permission_callback"](
-                ToolPermissionRequest("execute", {"command": "safe"}, "approval-1")
-            )
-            yield ToolResultEvent(output="allowed" if allowed else "denied", call_id="approval-1")
-        elif prompt == "ask":
-            answer = await self.callbacks["user_input_callback"](
-                UserInputRequest("Choose database", ("postgres", "mysql"), "ask-1")
-            )
-            yield TextDeltaEvent(text=answer)
-        else:
-            yield TextDeltaEvent(text=f"reply {len(self.prompts)}")
-        self.usage = UsageSnapshot(
-            input_tokens=len(self.prompts) * 10, output_tokens=len(self.prompts) * 2
-        )
-        yield UsageEvent(usage=self.usage)
-        yield ResultEvent(stop_reason="max_turns" if prompt == "limit" else "end_turn")
+    async def prepare_graph(self):
+        self.prepare_calls += 1
+        self._resources = {"agent": self.graph}
+        return self.graph
+
+    async def prompt(self, *_args, **_kwargs):
+        raise AssertionError("ACP must drive the native graph through the official server")
 
     async def steer(self, text):
         await self.steering.put((text, "steer-message-1"))
@@ -76,19 +55,130 @@ class FakeSession:
 
     async def cancel(self):
         self.cancelled.set()
+        await super().cancel()
 
     async def aclose(self):
         self.closed = True
+        await super().aclose()
+
+
+class FakeGraph:
+    """Emit native LangGraph frames; never reconstruct provider events."""
+
+    def __init__(self, session):
+        self.session = session
+        self.checkpointer = object()
+        self.invocations = []
+
+    async def aget_state(self, _config):
+        return SimpleNamespace(interrupts=(), metadata={}, values={"messages": []})
+
+    async def astream(self, value, *, config, stream_mode, subgraphs):
+        from langchain_core.messages import AIMessageChunk, ToolMessage
+
+        from lightspeed_agentic.session import SessionTurnLimitError
+
+        assert stream_mode == ["messages", "updates", "custom"]
+        assert subgraphs is True
+        assert config["configurable"]["thread_id"] == self.session.session_id
+        assert len(config["callbacks"]) == 1
+        self.invocations.append((value, config))
+        prompt = "\n".join(block["text"] for block in value["messages"][0]["content"])
+        session = self.session
+        session.prompts.append((prompt, session._max_turns))
+        session.cancelled.clear()
+        if prompt == "secret failure":
+            raise RuntimeError("credential-supersecret model-content-supersecret")
+        if session.pending_input == "permission":
+            await session.permission_callback(ToolPermissionRequest("execute", {}, "pending-1"))
+        elif session.pending_input == "human":
+            await session.user_input_callback(
+                UserInputRequest("Choose database", ("postgres", "mysql"))
+            )
+            yield (), "messages", (AIMessageChunk(content="must only continue with an answer"), {})
+        elif prompt in ("wait", "steer"):
+            yield (
+                (),
+                "messages",
+                (
+                    AIMessageChunk(
+                        content="",
+                        tool_call_chunks=[
+                            {
+                                "name": "execute",
+                                "args": '{"command":"safe"}',
+                                "id": "call-1",
+                                "index": 0,
+                            }
+                        ],
+                    ),
+                    {},
+                ),
+            )
+            if prompt == "wait":
+                await asyncio.Future()
+            guidance, message_id = await session.steering.get()
+            session._event_sink(UserMessageEvent(text=guidance, message_id=message_id))
+            yield (), "messages", (AIMessageChunk(content=guidance), {})
+        elif prompt == "approve":
+            allowed = await session.permission_callback(
+                ToolPermissionRequest("execute", {"command": "safe"}, "approval-1")
+            )
+            yield (
+                (),
+                "messages",
+                (
+                    AIMessageChunk(
+                        content="",
+                        tool_call_chunks=[
+                            {
+                                "name": "execute",
+                                "args": '{"command":"safe"}',
+                                "id": "approval-1",
+                                "index": 0,
+                            }
+                        ],
+                    ),
+                    {},
+                ),
+            )
+            result = ToolMessage(
+                content="allowed" if allowed else "denied",
+                name="execute",
+                tool_call_id="approval-1",
+            )
+            yield (), "messages", (result, {})
+            from lightspeed_agentic.inspection.middleware import ToolResultInspectionMiddleware
+
+            signature = ToolResultInspectionMiddleware._signature(
+                "execute", "result", "approval-1", result.content
+            )
+            yield (), "custom", {"lightspeed.accepted_tool_results": {signature}}
+        elif prompt == "ask":
+            answer = await session.user_input_callback(
+                UserInputRequest("Choose database", ("postgres", "mysql"), "ask-1")
+            )
+            yield (), "messages", (AIMessageChunk(content=answer), {})
+        else:
+            yield (), "messages", (AIMessageChunk(content=f"reply {len(session.prompts)}"), {})
+        session.turns_used += 1
+        session.usage = UsageSnapshot(
+            input_tokens=len(session.prompts) * 10, output_tokens=len(session.prompts) * 2
+        )
+        session._event_sink(UsageEvent(usage=session.usage))
+        if prompt == "limit":
+            raise SessionTurnLimitError()
 
 
 class FakeProvider:
     def __init__(self):
         self.sessions = []
         self.options = []
+        self._model_route = SimpleNamespace(model="offline", telemetry_provider="offline")
 
     def create_session(self, _options, **callbacks):
         self.options.append(_options)
-        session = FakeSession(**callbacks)
+        session = FakeSession(self, _options, **callbacks)
         self.sessions.append(session)
         return session
 
@@ -169,13 +259,26 @@ def prompt(session_id, text):
     return {"sessionId": session_id, "prompt": [{"type": "text", "text": text}]}
 
 
-async def test_two_prompts_cumulative_usage(tmp_path):
+async def test_two_prompts_cumulative_usage(tmp_path, monkeypatch):
+    from deepagents_acp.server import AgentServerACP
+
+    official_graphs = []
+    official_prompt = AgentServerACP.prompt
+
+    async def record_official_prompt(agent, *args, **kwargs):
+        official_graphs.append(agent._agent)
+        return await official_prompt(agent, *args, **kwargs)
+
+    monkeypatch.setattr(AgentServerACP, "prompt", record_official_prompt)
     async with server(tmp_path) as (url, provider, config), connect(url) as ws:
         session_id = await initialize(ws, config)
         for request_id, text in ((3, "first"), (4, "second")):
             await send(ws, request_id, "session/prompt", prompt(session_id, text))
             result, updates = await response(ws, request_id)
-            assert result["result"] == {"stopReason": "end_turn"}
+            assert result["result"] == {
+                "stopReason": "end_turn",
+                "_meta": {"lightspeed": {"turnsUsed": 1}},
+            }
             usage = [
                 u["params"]["update"]
                 for u in updates
@@ -191,6 +294,9 @@ async def test_two_prompts_cumulative_usage(tmp_path):
             )
         assert len(provider.sessions) == 1
         assert provider.sessions[0].prompts == [("first", 7), ("second", 7)]
+        assert provider.sessions[0].prepare_calls == 2
+        assert len(provider.sessions[0].graph.invocations) == 2
+        assert [graph.graph for graph in official_graphs] == [provider.sessions[0].graph] * 2
 
 
 async def test_cancel_running_prompt_without_blocking_reader(tmp_path):
@@ -233,9 +339,15 @@ async def test_permission_reply_during_prompt(tmp_path, outcome, expected):
         )
         result, updates = await response(ws, 3)
         assert "error" not in result
-        tool = updates[0]["params"]["update"]
+        tool = next(
+            frame["params"]["update"]
+            for frame in updates
+            if frame["params"]["update"]["sessionUpdate"] == "tool_call_update"
+        )
         assert tool["toolCallId"] == "approval-1"
-        assert tool["content"][0]["content"]["text"] == expected
+        assert tool["content"][0]["content"]["text"] == (
+            f"**Command:**\n```bash\nsafe\n```\n\n**Output:**\n```\n{expected}\n```\n"
+        )
 
 
 async def test_steer_matches_active_run_and_preserves_message_id(tmp_path):
@@ -371,24 +483,20 @@ async def test_replay_preserves_cumulative_usage_extension_method(tmp_path):
             assert usage_frames[-1]["params"]["update"]["inputTokens"] == 10
 
 
-class AwaitingPermissionProvider:
+class AwaitingPermissionProvider(FakeProvider):
     """Real RuntimeSession cancellation around an offline suspended provider call."""
 
     def create_session(self, options, **callbacks):
-        return RuntimeSession(self, options, **callbacks)
-
-    async def _query(self, _options, *, session):
-        await session.permission_callback(ToolPermissionRequest("execute", {}, "pending-1"))
-        yield ResultEvent()
+        session = super().create_session(options, **callbacks)
+        session.pending_input = "permission"
+        return session
 
 
 class AwaitingHumanProvider(AwaitingPermissionProvider):
-    async def _query(self, _options, *, session):
-        await session.user_input_callback(
-            UserInputRequest("Choose database", ("postgres", "mysql"))
-        )
-        yield TextDeltaEvent(text="must only continue with an answer")
-        yield ResultEvent()
+    def create_session(self, options, **callbacks):
+        session = super().create_session(options, **callbacks)
+        session.pending_input = "human"
+        return session
 
 
 async def test_cancel_while_permission_response_pending(tmp_path):
@@ -477,7 +585,7 @@ import lightspeed_agentic.readiness as readiness
 import lightspeed_agentic.tls as tls
 from lightspeed_agentic.acp.config import ACPConfig
 from lightspeed_agentic.session import RuntimeSession
-from lightspeed_agentic.types import ToolCallEvent
+from langchain_core.messages import AIMessageChunk
 root = Path(sys.argv[1])
 config.resolve_model_family = lambda: SimpleNamespace()
 config.parse_reasoning_config = lambda: None
@@ -492,16 +600,27 @@ mcp.discover_and_admit_mcp_servers = admit
 mcp.split_admitted_mcp_servers = lambda servers: ([], [])
 mcp.render_mcp_policy_context = lambda policies: ""
 class Provider:
+    _model_route = SimpleNamespace(model="offline", telemetry_provider="offline")
     def create_session(self, options, **callbacks):
         return RuntimeSession(self, options, **callbacks)
-    async def _query(self, options, *, session):
+    async def prepare_graph(self, options, *, session):
+        if not session._resources:
+            session._resources = {"agent": Graph()}
+        return session._resources
+    async def aclose(self):
+        (root / "provider-closed").write_text("yes")
+class Graph:
+    checkpointer = True
+    async def aget_state(self, config):
+        return SimpleNamespace(interrupts=(), values={"messages": []})
+    async def astream(self, value, **kwargs):
         try:
-            yield ToolCallEvent(name="execute", call_id="active-tool")
+            yield (), "messages", (AIMessageChunk(content="", tool_call_chunks=[{
+                "name": "execute", "args": "{}", "id": "active-tool", "index": 0
+            }]), {})
             await asyncio.Future()
         finally:
             (root / "session-closed").write_text("yes")
-    async def aclose(self):
-        (root / "provider-closed").write_text("yes")
 deepagents.DeepAgentsProvider = lambda route: Provider()
 original_serve = main.serve
 async def serve(*args, **kwargs):

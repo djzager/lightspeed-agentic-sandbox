@@ -68,6 +68,24 @@ inspection rejection before model/client release, cumulative usage, cleanup, act
 coroutine cancellation, and shell child-process cancellation without delayed file effects.
 Existing provider/inspection suites continue to exercise the one-shot lifecycle.
 
+The optional ACP entrypoint reuses the actual official `AgentServerACP` prompt
+loop and SDK method router over the harness's authenticated loopback WebSocket.
+`DeepAgentsProvider.prepare_graph()` is shared preparation, not a second graph
+implementation. `RuntimeSession.graph_execution()` exposes native execution
+ownership for this driver; the native graph/checkpointer and model/client
+lifetimes remain session-owned. A stream proxy releases only exact current
+result occurrences covered by a completed inspection boundary in the same
+namespace, keeps consuming while inspection runs, and keeps child frames
+internal. Viewer replay journals authorized publications plus incoming user
+prompts rather than unioning checkpoint history. Replay keeps owner permissions
+and pending human requests intact. It is process-local and bounded, with no
+restart durability. Private upstream seams, immutable dependency pin, retention
+limits and supported protocol scope are documented in
+[`acp/README.md`](../../../src/lightspeed_agentic/acp/README.md).
+Native execution and official-server compatibility regressions are in
+`tests/test_acp_native.py`; transport/UI contracts are in `tests/test_acp.py`
+and `tests/test_acp_ui.py`.
+
 ## Behavioral Rules
 
 1. **AgentProvider.** Each backend implements a `name` property and a `query` method accepting `ProviderQueryOptions` and returning an async iterator of `ProviderEvent`.

@@ -41,7 +41,7 @@ provide the standard ACP stdio transport.
 Supported methods are `initialize`, `session/new`, `session/prompt`,
 `session/cancel`, `session/set_mode`, and `session/load`. Text prompts only.
 Multiple prompts share the same in-memory runtime/checkpointer. Load replays
-normalized, inspected history across viewer connections while the process lives;
+authorized viewer history across viewer connections while the process lives;
 there is no restart persistence. The optional `replay_primary_session` setting
 defaults to false. When enabled, the first successfully created session is the
 launcher's primary session; the launcher must create it before exposing any
@@ -139,3 +139,76 @@ The native `output_config` form is also accepted; normalized `effort` takes
 precedence when both are supplied. No effort or thinking default is imposed, and
 model/API support remains provider-specific. This configuration applies to the
 agent pass; classifier and shaping calls keep reasoning unconfigured.
+
+## Official server and native graph composition
+
+The optional extra pins `deepagents-acp` to the immutable upstream source commit
+`f2a6e02dc8e2dcb05885c5133b94102ccc79b794` (0.0.13) and ACP SDK 0.10.1.
+`uv sync --frozen --extra dev` installs the tested dependency set. Production
+batch extras, model defaults and backend selection remain unchanged. The Git
+source pin is intentional: matching a PyPI version alone does not establish
+that it contains the tested implementation.
+
+`DeepAgentsProvider.prepare_graph()` supplies the existing native compiled graph,
+backend, admitted tools, middleware and main/classifier clients. `RuntimeSession`
+retains the graph/checkpointer and owns cancellation, steering, model-turn limits,
+cumulative usage and cleanup. `LightspeedACPServer` subclasses the official
+`AgentServerACP`; the official SDK router decodes standard methods, and the
+actual official `prompt()` loop renders the graph's ACP messages and tool calls.
+Lightspeed wraps that loop with launcher/owner policy and its existing callback
+permissions/questions. It does not use the upstream HITL permission mechanism
+or copy the upstream prompt loop.
+
+`InspectedGraph` passes native frames through while buffering tool results. It
+keeps pulling the graph so inspection can finish. Only a completed boundary's
+acceptance releases pending occurrences with the exact tool name, result/error
+status, call ID and content signature from that same subgraph namespace.
+Classification-cache entries do not authorize output. Child graph frames remain
+internal; they cannot authorize parent output. Buffers fail closed above 256
+pending results or 8 MiB. Rejection, classifier failure, missing acceptance,
+content/status changes and cancellation never release those pending payloads.
+The normal model-input inspection middleware stays in its existing order,
+including inspection of tools selected by the final allowed model call.
+
+Viewer history records authorized publication attempts and incoming user prompts,
+including consumed steering, original session/message IDs and cumulative usage
+extensions. It never reconstructs display permission from checkpoint history.
+The journal keeps a 16 MiB tail per session; truncated replay announces
+`_meta.lightspeed.historyTruncated`. A viewer load does not transfer ownership,
+execute tools, repeat a pending permission/question request, consume its answer,
+or cancel the owning connection's active work. Pending replies remain attached
+to the owner's original request and cancellation cleans them up. This journal
+is process-local viewer replay, not durable ACP conversation recovery or proof
+that a peer received a publication. There is no recovery after process exit.
+
+The integration depends on five private upstream methods, all pinned and
+covered by native compatibility/regression tests:
+
+- `_reset_agent`: select the session's prepared native graph view.
+- `_session_config`: use the same native thread for streaming, state and repair.
+- `_persist_session`: keep metadata in RuntimeSession rather than pretending
+  the viewer journal is a durable checkpoint store.
+- `_replay_session`: replay only the authorized viewer journal.
+- `_process_tool_call_chunks`: retain inspected `edit_file` completion output
+  that upstream otherwise suppresses after its input diff. Failed tool results
+  retain `failed` status through the publication wrapper.
+
+Execution is active during asynchronous graph preparation and native streaming.
+Cancel awaits the actual model/tool/classifier/question coroutine and repairs
+unanswered tool calls before a later prompt can continue. Timeout and owner
+cleanup use the same repair path. After the final graph boundary, steering
+admission closes before shaping and terminal publication; late steering is
+rejected. Terminal notification writes cannot let a late cancel remove the
+pending prompt response. Accepted steering spends the same prompt's remaining
+main-model allowance. Optional programmatic structured output still uses the
+existing tool-free shaping pass and counts its observed usage without spending
+a main-model turn.
+
+`tests/test_acp_native.py` exercises the actual official class and native
+Lightspeed/DeepAgents graphs with scripted offline models and classifiers.
+It covers delayed acceptance, whole-batch failure, exact occurrence/namespace
+matching, rejection/pending replay, two prompts, budget handoff, preparation and
+model cancellation, timeout repair, shaping, failed edit results and terminal
+steering/cancel races. `tests/test_acp.py` and `tests/test_acp_ui.py` cover real
+loopback WebSocket framing, host policy, permission/question concurrency, trusted
+stdio cleanup and existing UI wire behavior. No paid model or cluster is needed.

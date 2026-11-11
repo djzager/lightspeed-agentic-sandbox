@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import suppress
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Literal
 
@@ -77,6 +77,8 @@ class RuntimeSession:
         self._cancel_requested = False
         self._closed = False
         self._steering: list[tuple[str, str]] = []
+        self._accepting_steering = False
+        self._event_sink: Callable[[ProviderEvent], None] | None = None
 
     def _observe_usage(self, response: Any, *, is_main: bool = True) -> None:
         """Capture present counts at model completion, even if a later tool is cancelled."""
@@ -95,8 +97,46 @@ class RuntimeSession:
         observed = UsageSnapshot(input_tokens=input_tokens, output_tokens=output_tokens)
         if observed != self.usage:
             self.usage = observed
+            event = UsageEvent(usage=observed)
             if self._queue is not None:
-                self._queue.put_nowait(UsageEvent(usage=observed))
+                self._queue.put_nowait(event)
+            if self._event_sink is not None:
+                self._event_sink(event)
+
+    async def prepare_graph(self) -> Any:
+        """Return the actual reusable graph without starting a prompt."""
+        if self._closed:
+            raise RuntimeError("Session is closed")
+        prepared = await self._provider.prepare_graph(self._options, session=self)
+        self._resources["schema_model"] = prepared.get("schema_model")
+        self._resources["prepared_schema"] = prepared.get("prepared_schema")
+        return prepared["agent"]
+
+    @asynccontextmanager
+    async def graph_execution(
+        self, max_turns: int, event_sink: Callable[[ProviderEvent], None]
+    ) -> AsyncIterator[None]:
+        """Claim the session while an external driver streams its native graph.
+
+        ACP supplies the official prompt loop; execution controls and owned
+        resources remain shared with transport-independent session prompts.
+        """
+        async with self._lock:
+            if self._closed:
+                raise RuntimeError("Session is closed")
+            self._active = asyncio.current_task()
+            self._max_turns = max_turns
+            self.turns_used = 0
+            self._cancel_requested = False
+            self._event_sink = event_sink
+            self._accepting_steering = True
+            try:
+                yield
+            finally:
+                self._active = None
+                self._event_sink = None
+                self._accepting_steering = False
+                self._steering.clear()
 
     async def prompt(
         self,
@@ -125,6 +165,7 @@ class RuntimeSession:
             self._cancel_requested = False
             self.turns_used = 0
             self._max_turns = options.max_turns
+            self._accepting_steering = True
             self._active = asyncio.create_task(self._run_prompt(options, queue))
             self._active.add_done_callback(lambda task: self._task_done(task, queue))
             try:
@@ -138,6 +179,7 @@ class RuntimeSession:
                 with suppress(asyncio.CancelledError):
                     await self._active
                 self._active = None
+                self._accepting_steering = False
                 self._queue = None
 
     async def _run_prompt(
@@ -214,7 +256,12 @@ class RuntimeSession:
 
     async def steer(self, text: str) -> str:
         """Queue user guidance for the next safe main-model boundary of this prompt."""
-        if self._closed or self._active is None or self._active.done():
+        if (
+            self._closed
+            or not self._accepting_steering
+            or self._active is None
+            or self._active.done()
+        ):
             raise RuntimeError("No active prompt to steer")
         message_id = uuid.uuid4().hex
         self._steering.append((message_id, text))
@@ -227,6 +274,9 @@ class RuntimeSession:
         if self._queue is not None:
             for message_id, text in pending:
                 self._queue.put_nowait(UserMessageEvent(text=text, message_id=message_id))
+        if self._event_sink is not None:
+            for message_id, text in pending:
+                self._event_sink(UserMessageEvent(text=text, message_id=message_id))
         return [HumanMessage(content=text, id=message_id) for message_id, text in pending]
 
     async def _finish_unanswered_tools(self, reason: str) -> None:
