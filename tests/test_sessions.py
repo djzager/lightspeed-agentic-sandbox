@@ -18,6 +18,7 @@ from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFaile
 from lightspeed_agentic.providers.deepagents import DeepAgentsProvider
 from lightspeed_agentic.session import UserInputRequest
 from lightspeed_agentic.types import (
+    ModelOutputLimitError,
     ProviderQueryOptions,
     ResultEvent,
     ToolResultEvent,
@@ -534,4 +535,80 @@ async def test_shaping_usage_is_counted_without_spending_a_main_model_turn(tmp_p
     assert events[-1].stop_reason == "end_turn"
     assert events[-1].turns_used == 1
     assert session.usage == UsageSnapshot(10, 6)
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["max_tokens", "length", "MAX_TOKENS"])
+async def test_native_output_cutoff_is_not_success_and_session_can_continue(
+    tmp_path: Path, reason: str
+) -> None:
+    session, _factory, _inputs = _session(
+        tmp_path,
+        [
+            AIMessage(
+                content=[
+                    {"type": "thinking", "thinking": "Unfinished outline", "signature": "test"}
+                ],
+                response_metadata={"stop_reason": reason},
+                usage_metadata={"input_tokens": 12, "output_tokens": 4096, "total_tokens": 4108},
+            ),
+            AIMessage(
+                content="Completed on follow-up", response_metadata={"stop_reason": "end_turn"}
+            ),
+        ],
+    )
+    events = []
+
+    async def consume() -> None:
+        async for event in session.prompt("write the plan"):
+            events.append(event)
+
+    with pytest.raises(ModelOutputLimitError, match="output token limit"):
+        await consume()
+    assert not any(isinstance(event, ResultEvent) for event in events)
+    assert session.usage == UsageSnapshot(input_tokens=12, output_tokens=4096)
+    assert session.turns_used == 1
+    followup = await _collect(session, "Continue with a concise answer")
+    assert followup[-1].text == "Completed on follow-up"
+    assert followup[-1].stop_reason == "end_turn"
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_explicit_main_output_budget_reaches_model_constructor(tmp_path: Path) -> None:
+    session, factory, _inputs = _session(tmp_path, [AIMessage(content="Done")])
+    session._options = replace(session._options, max_output_tokens=16384)
+    await _collect(session)
+    parameters = factory.call_args.args[0]
+    assert parameters.max_output_tokens == 16384
+    assert session._provider._model_route.model_parameters.max_output_tokens is None
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+async def test_truncated_model_cannot_execute_selected_tool_or_continue(tmp_path: Path) -> None:
+    marker = tmp_path / "must-not-exist"
+    message = _call("execute", {"command": f"touch {marker}"})
+    message.response_metadata = {"stop_reason": "max_tokens"}
+    message.usage_metadata = {"input_tokens": 12, "output_tokens": 4096, "total_tokens": 4108}
+    session, _factory, inputs = _session(tmp_path, [message, AIMessage(content="Done")])
+    with pytest.raises(ModelOutputLimitError):
+        await _collect(session)
+    assert not marker.exists()
+    assert len(inputs) == 1
+    assert session.usage == UsageSnapshot(input_tokens=12, output_tokens=4096)
+    await session.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["cancelled", "max_turns"])
+async def test_session_preserves_provider_non_success_terminal_reason(tmp_path, reason) -> None:
+    session, _factory, _inputs = _session(tmp_path, [])
+
+    async def query(_options, **_kwargs):
+        yield ResultEvent(stop_reason=reason)
+
+    session._provider._query = query
+    assert (await _collect(session))[-1].stop_reason == reason
     await session.aclose()

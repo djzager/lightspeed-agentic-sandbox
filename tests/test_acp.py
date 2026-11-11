@@ -102,11 +102,18 @@ async def server(
     provider_override=None,
     mode="auto",
     config_overrides=None,
+    options_overrides=None,
 ):
     config = ACPConfig(
         cwd=str(tmp_path), max_turns=7, ask_user=ask_user, mode=mode, **(config_overrides or {})
     )
-    options = ProviderQueryOptions(prompt="", system_prompt="rules", max_turns=7, cwd=str(tmp_path))
+    options = ProviderQueryOptions(
+        prompt="",
+        system_prompt="rules",
+        max_turns=7,
+        cwd=str(tmp_path),
+        **(options_overrides or {}),
+    )
     provider = provider_override or FakeProvider()
     listening = asyncio.get_running_loop().create_future()
     task = asyncio.create_task(
@@ -646,3 +653,48 @@ mcp.run(transport="stdio")
         )
         with pytest.raises(ProcessLookupError):
             os.kill(helper_pid, 0)
+
+
+async def test_native_model_cutoff_is_an_acp_error_not_end_turn(tmp_path):
+    from unittest.mock import Mock
+
+    from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+    from langchain_core.messages import AIMessage
+
+    from lightspeed_agentic.providers.deepagents import DeepAgentsProvider
+
+    from .helpers import make_model_route
+
+    class Model(FakeMessagesListChatModel):
+        def bind_tools(self, _tools, **_kwargs):
+            return self
+
+    model = Model(
+        responses=[
+            AIMessage(
+                content=[{"type": "thinking", "thinking": "Unfinished", "signature": "test"}],
+                response_metadata={"stop_reason": "max_tokens"},
+                usage_metadata={"input_tokens": 12, "output_tokens": 4096, "total_tokens": 4108},
+            )
+        ]
+    )
+    provider = DeepAgentsProvider(make_model_route(Mock(return_value=model)))
+    async with (
+        server(
+            tmp_path,
+            provider_override=provider,
+            options_overrides={"tool_output_inspection_enabled": False},
+        ) as (url, _provider, config),
+        connect(url) as ws,
+    ):
+        session_id = await initialize(ws, config)
+        await send(ws, 3, "session/prompt", prompt(session_id, "write plan"))
+        result, updates = await response(ws, 3)
+        assert result["error"] == {"code": -32603, "message": "runtime operation failed"}
+        assert "result" not in result
+        usage = [
+            u["params"]["update"]
+            for u in updates
+            if u["params"]["update"]["sessionUpdate"] == "usage_update"
+        ]
+        assert usage[-1]["outputTokens"] == 4096

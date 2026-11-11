@@ -118,3 +118,16 @@ closes the provider. Errors are payload-free, helper stderr is suppressed, and
 the adapter writes no protocol or model content to stdout. Offline verification
 is in `tests/test_acp.py`; it includes concurrent wire operations, a real MCP stdio
 bridge, replay, and process-level SIGTERM cleanup.
+
+## Model output limits
+
+Set `LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS=16384` explicitly when a model needs a
+larger per-response allowance than its SDK default. The setting applies to the
+main graph model; separate safety-classifier and shaping calls keep their existing
+settings. It is optional, must be a positive integer, and does not change monetary
+or turn budgets. Reasoning can share the output allowance with answer text.
+
+A provider-reported output cutoff fails the active prompt through ACP's existing
+runtime-operation error. Its observed usage remains available, and a subsequent
+explicit prompt can continue the same in-memory session. The adapter does not
+automatically repeat a costly or truncated request.

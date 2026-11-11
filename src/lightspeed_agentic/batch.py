@@ -20,6 +20,7 @@ from typing import Any
 from lightspeed_agentic.config import (
     parse_agent_timeout,
     parse_max_turns,
+    parse_model_max_output_tokens,
     parse_reasoning_config,
     parse_tool_output_inspection_enabled,
     resolve_model_family,
@@ -176,6 +177,7 @@ def main() -> None:
         model_family = resolve_model_family()
         model_route = resolve_model_route(model_family=model_family)
         reasoning_config = parse_reasoning_config()
+        max_output_tokens = parse_model_max_output_tokens()
         mcp_servers = parse_mcp_servers()
         agent_timeout_seconds = parse_agent_timeout()
         agent_max_turns = parse_max_turns()
@@ -229,6 +231,7 @@ def main() -> None:
                 timeout_seconds=agent_timeout_seconds,
                 mcp_servers=provider_mcp_servers,
                 reasoning_config=reasoning_config,
+                max_output_tokens=max_output_tokens,
                 tool_output_inspection_enabled=tool_output_inspection_enabled,
                 audit_enabled=audit_enabled,
                 capture_content=capture_content,

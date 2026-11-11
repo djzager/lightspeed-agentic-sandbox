@@ -166,7 +166,6 @@ class RuntimeSession:
                             event,
                             input_tokens=self.usage.input_tokens or 0,
                             output_tokens=self.usage.output_tokens or 0,
-                            stop_reason="end_turn",
                             turns_used=self.turns_used,
                         )
                     elif event.type == "text_delta":

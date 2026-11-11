@@ -1024,3 +1024,24 @@ def test_azure_typed_configuration_retains_the_resolved_snapshot(
         )
     else:
         assert family.credentials == config.AzureApiKeyCredentialSource(api_key="original-key")
+
+
+@pytest.mark.parametrize("value", [None, "", "  "])
+def test_main_model_output_budget_absent_uses_sdk_default(monkeypatch, value) -> None:
+    if value is None:
+        monkeypatch.delenv("LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS", raising=False)
+    else:
+        monkeypatch.setenv("LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS", value)
+    assert config.parse_model_max_output_tokens() is None
+
+
+def test_main_model_output_budget_is_explicit(monkeypatch) -> None:
+    monkeypatch.setenv("LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS", " 16384 ")
+    assert config.parse_model_max_output_tokens() == 16384
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "1.5", "true", "invalid"])
+def test_main_model_output_budget_invalid_fails(monkeypatch, value) -> None:
+    monkeypatch.setenv("LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS", value)
+    with pytest.raises(ValueError, match="LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS"):
+        config.parse_model_max_output_tokens()

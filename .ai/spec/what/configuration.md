@@ -108,6 +108,8 @@ Anthropic routes and the Vertex/Google Gemini route use the shared DeepAgents ha
 
 10a. **Reasoning configuration.** When `LIGHTSPEED_REASONING_CONFIG` is set, the sandbox MUST parse it as a JSON object and make it available to provider adapters via `ProviderQueryOptions.reasoning_config`. When the env var is absent or empty, `reasoning_config` MUST be `None` and adapters MUST use SDK defaults. When the value is present but is not valid JSON or parses to a non-object type (e.g. array, string, number), the sandbox MUST fail at startup with a descriptive error — it MUST NOT silently fall back to `None`. The sandbox MUST NOT validate the object's keys or values — the upstream SDK and model API validate at invocation time. When a run also has structured output (`output-schema` on the batch input), DeepAgents adapter behavior is defined in [provider-contract.md](provider-contract.md) rule 22 (Anthropic thinking vs forced tool choice). This field is aligned with the classic OLS `reasoning_config` model parameter ([OLS-3452]).
 
+10b. **Main-model output budget.** Optional `LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS` must be a positive integer when nonempty; invalid values fail at startup. Absent or empty preserves the model integration's SDK default. Batch and ACP pass the value through `ProviderQueryOptions.max_output_tokens` to the main graph model constructor. It does not alter the independently constructed tool-output classifier or structured-output shaping model. It is an output-token allowance per model response, not a turn count or monetary budget. Reasoning tokens may consume that allowance, according to the provider. The model API remains responsible for supported limits.
+
  1. **OpenAI base URL.** `LIGHTSPEED_PROVIDER_URL` takes precedence over legacy `OPENAI_BASE_URL`. Native/custom OpenAI captures the effective URL in typed route parameters without mutating `OPENAI_BASE_URL`. See rule 3a.
 
 11a. **OpenAI-compatible endpoints (vLLM, local services, RHOAI, RHEL AI).** ([OLS-3053]) When `OPENAI_BASE_URL` is set to a non-api.openai.com URL (e.g. vLLM, local service, RHOAI/RHEL AI deployment), the OpenAI provider adapts endpoint selection and configuration:
@@ -200,6 +202,7 @@ OPENAI_API_KEY: <token-or-placeholder>
 | ------------------ | ------ |
 | `LIGHTSPEED_PROVIDER` | Hosting backend from operator (see rule 1). Replaces direct SDK selection. |
 | `LIGHTSPEED_MODEL` | Model identifier from operator (see rule 1). |
+| `LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS` | Optional positive per-response output allowance for the main graph model; absent keeps SDK defaults (rule 10b). |
 | `LIGHTSPEED_MODEL_PROVIDER` | Model family on Vertex from operator: `anthropic` or `google` (see rule 1). |
 | `LIGHTSPEED_PROVIDER_URL` | Optional API endpoint override from operator (see rule 1). |
 | `LIGHTSPEED_PROVIDER_PROJECT` | Cloud project ID from operator (see rule 1). |

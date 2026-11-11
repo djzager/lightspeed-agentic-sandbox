@@ -157,6 +157,7 @@ async def run_agent_query(
     timeout_seconds: int,
     mcp_servers: list[AdmittedMCPProviderServer] | None = None,
     reasoning_config: dict[str, Any] | None = None,
+    max_output_tokens: int | None = None,
     tool_output_inspection_enabled: bool = True,
     audit_enabled: bool = False,
     capture_content: bool = False,
@@ -265,6 +266,7 @@ async def run_agent_query(
                         output_schema=output_schema,
                         mcp_servers=mcp_servers or [],
                         reasoning_config=reasoning_config,
+                        max_output_tokens=max_output_tokens,
                         tool_output_inspection_enabled=tool_output_inspection_enabled,
                         deadline=time.monotonic() + timeout_seconds,
                     )

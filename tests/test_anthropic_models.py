@@ -1130,3 +1130,103 @@ def test_module_import_does_not_load_optional_provider_sdks() -> None:
         check=False,
     )
     assert result.returncode == 0, result.stderr
+
+
+@pytest.mark.asyncio
+async def test_native_thinking_only_output_cutoff_fails_real_session(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    from dataclasses import replace
+
+    from lightspeed_agentic.config import AnthropicCredentialSource, ModelParameters
+    from lightspeed_agentic.providers.deepagents import DeepAgentsProvider
+    from lightspeed_agentic.providers.models.anthropic import create_direct_model
+    from lightspeed_agentic.types import (
+        ModelOutputLimitError,
+        ProviderQueryOptions,
+        ResultEvent,
+        UsageSnapshot,
+    )
+
+    from .helpers import make_model_route
+
+    message = {
+        "id": "msg_test",
+        "type": "message",
+        "role": "assistant",
+        "model": "unknown-compatible-model",
+        "content": [],
+        "stop_reason": None,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 12, "output_tokens": 0},
+    }
+    frames = [
+        {"type": "message_start", "message": message},
+        {
+            "type": "content_block_start",
+            "index": 0,
+            "content_block": {"type": "thinking", "thinking": "", "signature": ""},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "thinking_delta", "thinking": "Unfinished outline"},
+        },
+        {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "signature_delta", "signature": "test-signature"},
+        },
+        {"type": "content_block_stop", "index": 0},
+        {
+            "type": "message_delta",
+            "delta": {"stop_reason": "max_tokens", "stop_sequence": None},
+            "usage": {"input_tokens": 12, "output_tokens": 4096},
+        },
+        {"type": "message_stop"},
+    ]
+    requests = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content))
+        data = "".join(f"event: {frame['type']}\ndata: {json.dumps(frame)}\n\n" for frame in frames)
+        return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=data)
+
+    transport = httpx.MockTransport(respond)
+    with httpx.Client(transport=transport) as sync_client:
+        async with httpx.AsyncClient(transport=transport) as async_client:
+            monkeypatch.setattr(tls, "create_http_client", lambda: sync_client)
+            monkeypatch.setattr(tls, "create_async_http_client", lambda: async_client)
+            route = make_model_route(create_direct_model, model="unknown-compatible-model")
+            from dataclasses import replace
+
+            route = replace(
+                route,
+                model_parameters=ModelParameters(
+                    model=route.model,
+                    base_url="https://anthropic.example.test",
+                    credentials=AnthropicCredentialSource(api_key="test-api-key"),
+                ),
+            )
+            options = ProviderQueryOptions(
+                prompt="Write a concise plan",
+                system_prompt="Use tools to write the plan",
+                max_turns=4,
+                cwd=str(tmp_path),
+                tool_output_inspection_enabled=False,
+                max_output_tokens=16384,
+            )
+            session = DeepAgentsProvider(route).create_session(options)
+            events = []
+
+            async def consume() -> None:
+                async for event in session.prompt(options.prompt):
+                    events.append(event)
+
+            with pytest.raises(ModelOutputLimitError):
+                await consume()
+            assert session.usage == UsageSnapshot(input_tokens=12, output_tokens=4096)
+            assert not any(isinstance(event, ResultEvent) for event in events)
+            assert requests[0]["max_tokens"] == 16384
+            assert requests[0]["stream"] is True
+            await session.aclose()

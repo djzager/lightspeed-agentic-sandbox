@@ -700,12 +700,14 @@ async def test_close_model_clients_closes_only_initialized_clients() -> None:
         ("bedrock/anthropic", "aws.bedrock", "function_calling"),
     ],
 )
+@pytest.mark.parametrize("max_output_tokens", [None, 16384])
 async def test_resolved_route_controls_all_model_roles(
     monkeypatch: pytest.MonkeyPatch,
     route_id: str,
     telemetry_provider: str,
     method: Literal["function_calling", "json_schema", "sonnet-5-5", "opus-5-5", "fable-5-1"],
     reasoning: dict[str, Any] | None,
+    max_output_tokens: int | None,
 ) -> None:
     from lightspeed_agentic.providers import deepagents as mod
     from lightspeed_agentic.providers.models.openai import (
@@ -788,13 +790,14 @@ async def test_resolved_route_controls_all_model_roles(
             provider,
             _base_options(
                 reasoning_config=reasoning,
+                max_output_tokens=max_output_tokens,
                 output_schema=schema,
             ),
         )
 
     assert route.model_parameters.max_output_tokens is None
     assert create_model.call_args_list == [
-        call(route.model_parameters, reasoning),
+        call(replace(route.model_parameters, max_output_tokens=max_output_tokens), reasoning),
         call(route.model_parameters, None),
         call(route.model_parameters, None),
     ]
@@ -2134,7 +2137,8 @@ async def test_provider_installs_boundary_when_inspection_is_disabled() -> None:
     )
     middleware = kwargs.get("middleware", [])
     subagents = kwargs.get("subagents", [])
-    assert len(middleware) == 2
+    assert len(middleware) == 3
+    assert middleware[2].name == "ModelOutputLimitMiddleware"
     assert isinstance(middleware[0], ToolResultInspectionMiddleware)
     assert middleware[0]._inspector is None
     assert middleware[1].name == "SummarizationMiddleware"

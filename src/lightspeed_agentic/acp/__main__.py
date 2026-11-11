@@ -16,6 +16,7 @@ from lightspeed_agentic.acp.server import serve
 async def run(config: ACPConfig, *, host: str, port: int) -> None:
     from lightspeed_agentic.config import (
         parse_agent_timeout,
+        parse_model_max_output_tokens,
         parse_reasoning_config,
         parse_tool_output_inspection_enabled,
         resolve_model_family,
@@ -48,6 +49,7 @@ async def run(config: ACPConfig, *, host: str, port: int) -> None:
         cwd=config.cwd,
         mcp_servers=servers,
         reasoning_config=parse_reasoning_config(),
+        max_output_tokens=parse_model_max_output_tokens(),
         tool_output_inspection_enabled=parse_tool_output_inspection_enabled(),
     )
     provider = DeepAgentsProvider(route)

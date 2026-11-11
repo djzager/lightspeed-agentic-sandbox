@@ -13,6 +13,7 @@ import os
 import time
 import uuid
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from uuid import UUID
 
@@ -31,6 +32,7 @@ from lightspeed_agentic.types import (
     ContentBlockStopEvent,
     MCPInitializationError,
     MCPToolNameCollisionError,
+    ModelOutputLimitError,
     ProviderEvent,
     ProviderQueryOptions,
     ResultEvent,
@@ -57,6 +59,25 @@ _JSON_SCHEMA_TYPE_MAP: dict[str, type[Any]] = {
     "number": float,
     "boolean": bool,
 }
+
+
+def _create_output_limit_middleware() -> Any:
+    """Reject provider-reported cutoff before the graph can execute selected tools."""
+    from langchain.agents.middleware import AgentMiddleware
+
+    class ModelOutputLimitMiddleware(AgentMiddleware[Any, Any, Any]):
+        async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+            response = await handler(request)
+            # SDK completion callbacks have already captured observed usage here.
+            for message in response.result:
+                metadata = getattr(message, "response_metadata", {})
+                if isinstance(metadata, Mapping):
+                    reason = metadata.get("stop_reason") or metadata.get("finish_reason")
+                    if isinstance(reason, str) and reason in {"max_tokens", "length", "MAX_TOKENS"}:
+                        raise ModelOutputLimitError()
+            return response
+
+    return ModelOutputLimitMiddleware()
 
 
 async def _close_model_clients(model: Any) -> None:
@@ -743,7 +764,15 @@ class DeepAgentsProvider(AgentProvider):
             session._resources["chat_model"]
             if session is not None and session._resources
             else self._model_route.create_model(
-                self._model_route.model_parameters, options.reasoning_config
+                replace(
+                    self._model_route.model_parameters,
+                    max_output_tokens=(
+                        options.max_output_tokens
+                        if options.max_output_tokens is not None
+                        else self._model_route.model_parameters.max_output_tokens
+                    ),
+                ),
+                options.reasoning_config,
             )
         )
         generation_callback: Any | None = None
@@ -888,7 +917,12 @@ class DeepAgentsProvider(AgentProvider):
                 summarization_middleware = create_tool_data_summarization_middleware(
                     chat_model, backend
                 )
-                middleware = [inspection_middleware, summarization_middleware]
+                output_limit_middleware = _create_output_limit_middleware()
+                middleware = [
+                    inspection_middleware,
+                    summarization_middleware,
+                    output_limit_middleware,
+                ]
                 if session is not None:
                     from lightspeed_agentic.session import create_session_tool_middleware
 
@@ -899,6 +933,7 @@ class DeepAgentsProvider(AgentProvider):
                         create_session_tool_middleware(session, consume_steering=False),
                         inspection_middleware,
                         summarization_middleware,
+                        output_limit_middleware,
                     ]
                     if session is not None
                     else middleware

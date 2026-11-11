@@ -429,6 +429,20 @@ def parse_tool_output_inspection_enabled() -> bool:
     raise ValueError("LIGHTSPEED_TOOL_OUTPUT_INSPECTION_ENABLED must be true or false")
 
 
+def parse_model_max_output_tokens() -> int | None:
+    """Optional main-model generation budget; absent keeps the SDK default."""
+    raw = os.environ.get("LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError("LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS must be a positive integer") from exc
+    if value <= 0:
+        raise ValueError("LIGHTSPEED_MODEL_MAX_OUTPUT_TOKENS must be a positive integer")
+    return value
+
+
 def parse_reasoning_config() -> dict[str, Any] | None:
     """Parse LIGHTSPEED_REASONING_CONFIG env var at startup.
 

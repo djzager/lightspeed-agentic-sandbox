@@ -36,6 +36,16 @@ LangGraph recursion limit protects graph execution. One-shot queries retain thei
 caller-supplied graph recursion limit. Terminal results expose `end_turn`, `max_turns`, or
 `cancelled`, plus observed completed main model calls as `turns_used`.
 
+An explicit native output cutoff (`max_tokens`, `length`, or `MAX_TOKENS`) raises
+a payload-free `ModelOutputLimitError` after the model stream completes and before
+the graph executes any selected tool or starts another model call. It never produces
+a successful terminal result or runs structured-output shaping on truncated text.
+This differs from the caller's main-model-call budget. Observed usage is retained
+and an explicit later session prompt may continue from the retained checkpoint.
+ACP returns its existing generic runtime-operation error; it does not advertise
+normal `end_turn` completion. Missing native finish metadata is not inferred from
+output length.
+
 `cancel()` cancels and awaits the active graph/tool coroutine. Session shell execution uses
 an awaitable POSIX subprocess backend, killing and reaping the shell process group on
 cancellation or timeout; this platform scope is Linux/macOS, not Windows. Completed effects
