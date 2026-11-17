@@ -8,6 +8,84 @@ Cross-references: batch agent invocation → `run-api.md`. Env and build → `co
 
 Anthropic, Vertex/Google, and native/custom OpenAI use DeepAgents. Native OpenAI means hosting `openai` with the default endpoint or an HTTPS `api.openai.com` hostname; [configuration rule 3a](configuration.md) defines URL precedence, normalization, and rejection of non-HTTPS native URLs. Custom/vLLM selects the `openai-compatible` DeepAgents route on Chat Completions. Azure also uses the shared DeepAgents harness through `AzureChatOpenAI`; Vertex supports only Anthropic and Google models; the legacy OpenAI adapter and factory entry are removed. Azure routing/workflows are offline-tested, not live-authentication acceptance. Shared DeepAgents rules below apply to native/custom OpenAI and Azure as well; Agents SDK-specific requirements below (`SandboxAgent`, `Runner`, `ModelResponse`, and its hooks) document the retired harness only; they no longer apply to runtime routes. Shared DeepAgents rules govern every implemented route. This implementation split does not complete the broader consolidation or waive live evidence and telemetry compatibility review.
 
+## Reusable in-memory sessions
+
+`DeepAgentsProvider.create_session(options, permission_callback=..., user_input_callback=...)`
+creates a transport-independent `RuntimeSession`. Construction is lazy. The session owns
+one stable thread ID, in-memory LangGraph checkpointer, compiled graph, and main/classifier
+model clients. Repeated `prompt()` calls retain conversation history; simultaneous prompts
+serialize. `query()` preserves its one-shot lifecycle and per-query token totals.
+
+Session mode defaults to `auto`. In `approve` mode an async permission callback must return
+approval immediately before SDK tool execution; missing callbacks deny execution. The
+optional local `ask_user` tool calls a trusted async user-input callback, without requiring
+approval for asking the user. A matching successful result is trusted only when this local
+tool was registered; conflicting admitted MCP names fail before graph execution. External
+tool results still pass the existing model-boundary inspection and independent normalized
+output release gate. Conventional `$HOME/.agents/skills` is exposed at `/skills/user/` in
+addition to skills under the working directory; rules remain caller-supplied instructions.
+
+`steer(text)` queues user guidance until the next main-model boundary, after any active
+tool completes. A consumption event carries its message ID. Guidance accepted during a
+final model response receives a follow-up invocation before the run's terminal result.
+For sessions, `max_turns` bounds completed main model calls per prompt. Tools selected by
+the final allowed call execute and cross the existing inspection/output gates; the next
+main model call is prevented. Steering shares that prompt budget. Separate tool-free
+structured-output shaping contributes usage but does not spend a main graph turn. An independent generous
+LangGraph recursion limit protects graph execution. One-shot queries retain their existing
+caller-supplied graph recursion limit. Terminal results expose `end_turn`, `max_turns`, or
+`cancelled`, plus observed completed main model calls as `turns_used`.
+
+An explicit native output cutoff (`max_tokens`, `length`, or `MAX_TOKENS`) raises
+a payload-free `ModelOutputLimitError` after the model stream completes and before
+the graph executes any selected tool or starts another model call. It never produces
+a successful terminal result or runs structured-output shaping on truncated text.
+This differs from the caller's main-model-call budget. Observed usage is retained
+and an explicit later session prompt may continue from the retained checkpoint.
+ACP returns its existing generic runtime-operation error; it does not advertise
+normal `end_turn` completion. Missing native finish metadata is not inferred from
+output length.
+
+`cancel()` cancels and awaits the active graph/tool coroutine. Session shell execution uses
+an awaitable POSIX subprocess backend, killing and reaping the shell process group on
+cancellation or timeout; this platform scope is Linux/macOS, not Windows. Completed effects
+are not rolled back. Unanswered calls receive stopped results in the checkpoint so a later
+prompt does not replay them. `aclose()` cancels active work and closes owned clients once.
+Session state is ephemeral and is not restorable after process exit.
+
+`session.usage` and `UsageEvent` carry cumulative observed input/output counts across
+prompts, updated after model completions, including main, subagent, summarization, and
+structured-output shaping calls. Isolated safety-classifier requests are excluded. Missing
+counts remain `None`; explicit zero remains zero. No cost or pricing is inferred. Legacy
+integer fields on `ResultEvent` retain their existing zero defaults; consumers that need
+presence semantics use the usage snapshot. Completed-call usage remains available if a
+later tool or model call is cancelled. Provider-native cost and context-window occupancy
+are not supplied by this core contract.
+
+Verification: `tests/test_sessions.py` uses real offline DeepAgents graphs for retained
+history, prompt serialization, steering, permission denial/grant, trusted user input,
+inspection rejection before model/client release, cumulative usage, cleanup, actual model
+coroutine cancellation, and shell child-process cancellation without delayed file effects.
+Existing provider/inspection suites continue to exercise the one-shot lifecycle.
+
+The optional ACP entrypoint reuses the actual official `AgentServerACP` prompt
+loop and SDK method router over the harness's authenticated loopback WebSocket.
+`DeepAgentsProvider.prepare_graph()` is shared preparation, not a second graph
+implementation. `RuntimeSession.graph_execution()` exposes native execution
+ownership for this driver; the native graph/checkpointer and model/client
+lifetimes remain session-owned. A stream proxy releases only exact current
+result occurrences covered by a completed inspection boundary in the same
+namespace, keeps consuming while inspection runs, and keeps child frames
+internal. Viewer replay journals authorized publications plus incoming user
+prompts rather than unioning checkpoint history. Replay keeps owner permissions
+and pending human requests intact. It is process-local and bounded, with no
+restart durability. Private upstream seams, immutable dependency pin, retention
+limits and supported protocol scope are documented in
+[`acp/README.md`](../../../src/lightspeed_agentic/acp/README.md).
+Native execution and official-server compatibility regressions are in
+`tests/test_acp_native.py`; transport/UI contracts are in `tests/test_acp.py`
+and `tests/test_acp_ui.py`.
+
 ## Behavioral Rules
 
 1. **AgentProvider.** Each backend implements a `name` property and a `query` method accepting `ProviderQueryOptions` and returning an async iterator of `ProviderEvent`.
@@ -50,7 +128,7 @@ Anthropic, Vertex/Google, and native/custom OpenAI use DeepAgents. Native OpenAI
 
 16. **ProviderQueryOptions — `mcp_servers`.** Optional list of provider-facing projections derived from the canonical admitted MCP server list. Each entry carries only `name`, `url`, `timeout`, resolved `headers`, and admitted tool names. Authentication classification, tool metadata, and RBAC declarations remain outside the provider boundary; batch derives the separate analysis policy projection from the canonical admission result. Adapters MAY convert headers to a dict at the SDK boundary and MAY reconnect or reload SDK tool objects, but they MUST filter those objects by the admitted names without independently admitting or reclassifying tools. When non-empty, adapters MUST initialize each admitted server and wire only admitted tools into their SDK mechanism (see rules 31–33). A reload or initialization error MUST fail the provider query rather than silently omit a server. A successful DeepAgents reload MAY return fewer tools than admission discovered; it MUST still filter out unadmitted tools. When empty or absent, no MCP servers are configured.
 
-17. **ProviderQueryOptions — `reasoning_config`.** Optional dict (JSON object). When present, adapters MUST map it to their model integration's native reasoning/thinking parameters. When absent or `None`, adapters MUST NOT set reasoning parameters and model defaults apply. DeepAgents passes Anthropic `thinking` settings to `ChatAnthropic*`; the Vertex Gemini constructor passes the configured object as `ChatGoogleGenerativeAI.thinking_config`. The legacy OpenAI adapter constructs `Reasoning(**rc)`. The relevant SDK/model validates keys and values; the sandbox MUST NOT silently strip unsupported settings.
+17. **ProviderQueryOptions — `reasoning_config`.** Optional dict (JSON object). When present, adapters MUST map it to their model integration's native reasoning/thinking parameters. When absent or `None`, adapters MUST NOT set reasoning parameters and model defaults apply. DeepAgents passes Anthropic `thinking` and native `output_config` settings to `ChatAnthropic*`, mapping the normalized `effort` option to `output_config.effort` (normalized `effort` takes precedence if both forms are supplied). This mapping does not enable or disable thinking. Vertex forwards these native API fields through its model integration's `model_kwargs`; the Vertex Gemini constructor passes the configured object as `ChatGoogleGenerativeAI.thinking_config`. The legacy OpenAI adapter constructs `Reasoning(**rc)`. The relevant SDK/model validates keys and values; the sandbox MUST NOT silently strip unsupported settings.
 
 18. **[Removed]** *(Claude adapter was removed in OLS-3500; Anthropic reasoning is now handled by the DeepAgents adapter — see rule 34.)*
 
@@ -147,6 +225,8 @@ DeepAgents telemetry requirements below include native/custom OpenAI, with route
  4. **Model integration.** The middleware MUST construct the isolated classifier from the resolved DeepAgents model configuration. It MUST omit the main agent's reasoning configuration and MUST NOT impose a classifier-specific output-token limit; resolved model settings and SDK/provider defaults apply. Input chunking MUST subtract instruction overhead from the context estimate without a fixed output-token reservation. The dedicated classifier model MUST disable SDK transport streaming before structured wrapping; the `nostream` tag excludes classifier output from graph messages but does not itself disable transport streaming. Main-agent streaming MUST remain unchanged. Before trusting an SDK-parsed decision, transport validation MUST require one native `ClassifierDecision` call (or one strict text decision), validate its arguments, and reject disagreement between raw and parsed representations. Where the SDK exposes serialized argument JSON, the model integration MUST preserve it for duplicate-key rejection; normalized argument dictionaries alone cannot establish that the original JSON was unambiguous. Invalid native envelopes use the existing bounded classifier retry/failure path without logging their contents. Anthropic classifiers use the same small JSON-schema decision contract on direct, Bedrock, and Vertex routes without selecting by model name. The pinned Vertex/Anthropic LangChain adapter ignores `method="json_schema"` and forces tool calls; the classifier MUST bind native `output_config.format` instead and validate the completed JSON text. This classifier policy is independent of final-answer shaping: direct Anthropic and Bedrock retain function calling for potentially large output schemas. Provider rejection or invalid output MUST fail closed.
 
  4a. **Azure input-filter policy.** The resolved Azure route MUST supply its classifier-client factory to the shared harness. Only during the isolated classifier call, a native SDK `BadRequestError` with HTTP 400 and structured code `content_filter` MUST normalize to `{"injectionDetected": true, "category": "unknown"}`. This includes the same rejection carrying explicit prompt-attack annotations (the bounded diagnostic reason `prompt_attack_filtered`). This is a conservative unsafe-content policy decision, not a completed model reply or proof of a particular injection category. It MUST terminate as malicious on the first attempt without retrying. Generic 400 errors, other codes/statuses, filtering-service failures, returned-output filtering/refusals, and malformed/incomplete decisions MUST retain their existing error and retry behavior. The policy MUST NOT apply to non-Azure classifiers, main-agent calls, or structured-output shaping. It MUST NOT inspect free-form provider messages or log provider bodies, classifier/tool content, or credentials.
+
+ 4b. **Native classifier thinking.** Completed Anthropic-compatible classifier replies MAY include native `thinking` blocks even when the request omits reasoning configuration. The decision parser MUST discard blocks whose `type` is `thinking` and whose `thinking` field is a string, and validate only the remaining strict JSON text. Thinking alone is not a decision. Unknown or malformed blocks, refusals, incomplete responses, tool-call ambiguity, raw/parsed disagreement, and invalid JSON/schema MUST retain fail-closed behavior. Classifier thinking MUST remain excluded from provider events and logs.
 
  5. **Local paths.** The interception paths include normal results, tool-generated errors, shell output, MCP output, file reads, and search results. They also include offload previews and references. Each later model-visible artifact read or search result MUST pass through the same middleware. Exceptions escaping an SDK tool handler MUST become payload-free `ToolExecutionError` operational failures, on both main and subagent paths and regardless of the inspection switch. The runner MUST NOT log their raw messages, traceback, or exception objects, or copy those details into Result summaries; diagnostics may retain the tool name and original exception class. Already-handled tool-error results MUST still pass through inspection. Cancellation and inspection failures MUST retain their existing semantics, including when propagating through a parent `task` tool.
 

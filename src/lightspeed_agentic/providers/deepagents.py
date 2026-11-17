@@ -15,6 +15,7 @@ import time
 import uuid
 from collections import defaultdict, deque
 from collections.abc import AsyncIterator, Mapping, Sequence
+from dataclasses import replace
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 from uuid import UUID
 
@@ -34,6 +35,7 @@ from lightspeed_agentic.types import (
     ContentBlockStopEvent,
     MCPInitializationError,
     MCPToolNameCollisionError,
+    ModelOutputLimitError,
     ProviderEvent,
     ProviderQueryOptions,
     ResultEvent,
@@ -46,6 +48,7 @@ from lightspeed_agentic.types import (
 
 if TYPE_CHECKING:
     from lightspeed_agentic.providers.model_router import ResolvedModelRoute
+    from lightspeed_agentic.session import PermissionCallback, RuntimeSession, UserInputCallback
 
 # Harness SDK imports (deepagents, langchain-*, MCP) stay inside functions.
 # Model construction and hosting configuration belong to the supplied model route.
@@ -59,6 +62,25 @@ _JSON_SCHEMA_TYPE_MAP: dict[str, type[Any]] = {
     "number": float,
     "boolean": bool,
 }
+
+
+def _create_output_limit_middleware() -> Any:
+    """Reject provider-reported cutoff before the graph can execute selected tools."""
+    from langchain.agents.middleware import AgentMiddleware
+
+    class ModelOutputLimitMiddleware(AgentMiddleware[Any, Any, Any]):
+        async def awrap_model_call(self, request: Any, handler: Any) -> Any:
+            response = await handler(request)
+            # SDK completion callbacks have already captured observed usage here.
+            for message in response.result:
+                metadata = getattr(message, "response_metadata", {})
+                if isinstance(metadata, Mapping):
+                    reason = metadata.get("stop_reason") or metadata.get("finish_reason")
+                    if isinstance(reason, str) and reason in {"max_tokens", "length", "MAX_TOKENS"}:
+                        raise ModelOutputLimitError()
+            return response
+
+    return ModelOutputLimitMiddleware()
 
 
 async def _close_model_clients(model: Any) -> None:
@@ -318,6 +340,7 @@ def _create_generation_callback(
     parent_context: Context,
     *,
     main_name: str | None,
+    usage_observer: Any | None = None,
 ) -> Any:
     """Capture model generations and redacted tool executions."""
     from langchain_core.callbacks import AsyncCallbackHandler
@@ -331,6 +354,7 @@ def _create_generation_callback(
             self._model = model_route.model
             self._provider = model_route.telemetry_provider
             self._main_name = main_name
+            self._usage_runs: dict[UUID, bool] = {}
 
         async def on_chat_model_start(
             self,
@@ -346,6 +370,13 @@ def _create_generation_callback(
             del serialized, messages, parent_run_id, kwargs
             tags = tags or []
             metadata = metadata or {}
+            if usage_observer is not None and "nostream" not in tags:
+                self._usage_runs[run_id] = metadata.get(
+                    "lc_agent_name"
+                ) == self._main_name and metadata.get("lc_source") not in {
+                    "summarization",
+                    "structured_output_shaping",
+                }
             if (
                 metadata.get("lc_agent_name") != self._main_name
                 or "nostream" in tags
@@ -368,6 +399,9 @@ def _create_generation_callback(
             **kwargs: Any,
         ) -> None:
             del kwargs
+            if run_id in self._usage_runs and usage_observer is not None:
+                is_main = self._usage_runs.pop(run_id)
+                usage_observer(response, is_main=is_main)
             span = self._spans.pop(run_id, None)
             if span is None:
                 return
@@ -643,7 +677,10 @@ async def _shape_structured_output(
             try:
                 result = await structured.ainvoke(
                     shape_messages,
-                    config={"callbacks": [generation_callback]},
+                    config={
+                        "callbacks": [generation_callback],
+                        "metadata": {"lc_source": "structured_output_shaping"},
+                    },
                 )
             except RecursionError:
                 if attempt == 1:
@@ -759,9 +796,38 @@ class DeepAgentsProvider(AgentProvider):
     def name(self) -> str:
         return "deepagents"
 
-    async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
-        parent_context = otel_context.get_current()
+    def create_session(
+        self,
+        options: ProviderQueryOptions,
+        *,
+        permission_callback: PermissionCallback | None = None,
+        user_input_callback: UserInputCallback | None = None,
+    ) -> RuntimeSession:
+        """Create a reusable in-memory session without constructing model clients yet."""
+        from lightspeed_agentic.session import RuntimeSession
 
+        return RuntimeSession(
+            self,
+            options,
+            permission_callback=permission_callback,
+            user_input_callback=user_input_callback,
+        )
+
+    async def query(self, options: ProviderQueryOptions) -> AsyncIterator[ProviderEvent]:
+        async for event in self._query(options):
+            yield event
+
+    async def prepare_graph(
+        self,
+        options: ProviderQueryOptions,
+        *,
+        session: RuntimeSession | None = None,
+    ) -> dict[str, Any]:
+        """Prepare the native graph and owned clients, without invoking the model.
+
+        Shared by batch/session streaming and the optional official ACP adapter.
+        The caller owns cleanup; failed construction closes clients here.
+        """
         from deepagents import create_deep_agent
         from deepagents.backends import CompositeBackend, FilesystemBackend, LocalShellBackend
 
@@ -783,8 +849,6 @@ class DeepAgentsProvider(AgentProvider):
 
         classifier_model: Any | None = None
         inspector_callback: Any | None = None
-        generation_callback: Any | None = None
-
         logger.debug(
             "Starting deepagents query route=%s model=%s cwd=%s max_turns=%s",
             self._model_route.route,
@@ -808,106 +872,305 @@ class DeepAgentsProvider(AgentProvider):
             if self._model_route.translate_output_schema is not None:
                 prepared_schema = self._model_route.translate_output_schema(schema_model)
 
-        chat_model = self._model_route.create_model(
-            self._model_route.model_parameters, options.reasoning_config
+        chat_model = (
+            session._resources["chat_model"]
+            if session is not None and session._resources
+            else self._model_route.create_model(
+                replace(
+                    self._model_route.model_parameters,
+                    max_output_tokens=(
+                        options.max_output_tokens
+                        if options.max_output_tokens is not None
+                        else self._model_route.model_parameters.max_output_tokens
+                    ),
+                ),
+                options.reasoning_config,
+            )
         )
         try:
-            local_backend = LocalShellBackend(
-                root_dir=options.cwd,
-                virtual_mode=False,
-                inherit_env=True,
-                max_output_bytes=MAX_TOOL_RETURN_CHARS,
-            )
-            skills_root = str(local_backend.cwd)
-            # SDK-native skills layout: the skills root is a virtual CompositeBackend
-            # route, so file tools advertise /skills/<name>/... while the SDK's
-            # FilesystemMiddleware injects the virtual-to-host path mapping that the
-            # shell needs (deepagents #3050/#3762 pattern). The default backend keeps
-            # physical paths for general work; artifacts stay in the agent home.
-            skills_backend = FilesystemBackend(root_dir=skills_root, virtual_mode=True)
-            backend = CompositeBackend(
-                default=local_backend,
-                routes={"/skills/": skills_backend},
-                artifacts_root=os.path.join(os.environ.get("HOME", "/home/agent"), ".deepagents"),
-            )
+            if session is None or not session._resources:
+                backend_class = LocalShellBackend
+                if session is not None:
+                    from lightspeed_agentic.session_backend import cancellable_shell_backend
 
-            instruction = TOOL_DATA_TRUST_INSTRUCTION.strip()
-            subagent_spec = {**GENERAL_PURPOSE_SUBAGENT}
-            subagent_system_prompt = subagent_spec.get("system_prompt") or ""
-            subagent_spec["system_prompt"] = (
-                f"{subagent_system_prompt}\n{instruction}"
-                if subagent_system_prompt
-                else instruction
-            )
-            agent_kwargs: dict[str, Any] = {
-                "model": chat_model,
-                "backend": backend,
-                "system_prompt": f"{options.system_prompt}\n{instruction}",
-            }
-
-            if options.tool_output_inspection_enabled:
-                try:
-                    from lightspeed_agentic.inspection.chunking import Utf8ByteCodec
-                    from lightspeed_agentic.inspection.client import LangChainClassifierClient
-                    from lightspeed_agentic.inspection.inspector import (
-                        inspect_tool_result as run_inspection,
+                    backend_class = cancellable_shell_backend()
+                local_backend = backend_class(
+                    root_dir=options.cwd,
+                    virtual_mode=False,
+                    inherit_env=True,
+                    max_output_bytes=MAX_TOOL_RETURN_CHARS,
+                )
+                skills_root = str(local_backend.cwd)
+                # SDK-native skills layout: the skills root is a virtual CompositeBackend
+                # route, so file tools advertise /skills/<name>/... while the SDK's
+                # FilesystemMiddleware injects the virtual-to-host path mapping that the
+                # shell needs (deepagents #3050/#3762 pattern). The default backend keeps
+                # physical paths for general work; artifacts stay in the agent home.
+                skills_backend = FilesystemBackend(root_dir=skills_root, virtual_mode=True)
+                skill_routes: dict[str, Any] = {"/skills/": skills_backend}
+                skill_sources = ["/skills/"] if has_skills(skills_root) else []
+                if session is not None:
+                    user_skills_root = os.path.join(
+                        os.environ.get("HOME", "/home/agent"), ".agents", "skills"
                     )
+                    if has_skills(user_skills_root):
+                        skill_routes["/skills/user/"] = FilesystemBackend(
+                            root_dir=user_skills_root,
+                            virtual_mode=True,
+                        )
+                        skill_sources.append("/skills/user/")
+                backend = CompositeBackend(
+                    default=local_backend,
+                    routes=skill_routes,
+                    artifacts_root=os.path.join(
+                        os.environ.get("HOME", "/home/agent"), ".deepagents"
+                    ),
+                )
 
-                    anthropic_route = self._model_route.route in {
-                        "anthropic",
-                        "vertex/anthropic",
-                        "bedrock/anthropic",
+                instruction = TOOL_DATA_TRUST_INSTRUCTION.strip()
+                subagent_spec = {**GENERAL_PURPOSE_SUBAGENT}
+                subagent_system_prompt = subagent_spec.get("system_prompt") or ""
+                subagent_spec["system_prompt"] = (
+                    f"{subagent_system_prompt}\n{instruction}"
+                    if subagent_system_prompt
+                    else instruction
+                )
+                agent_kwargs: dict[str, Any] = {
+                    "model": chat_model,
+                    "backend": backend,
+                    "system_prompt": f"{options.system_prompt}\n{instruction}",
+                }
+
+                if options.tool_output_inspection_enabled:
+                    try:
+                        from lightspeed_agentic.inspection.chunking import Utf8ByteCodec
+                        from lightspeed_agentic.inspection.client import LangChainClassifierClient
+                        from lightspeed_agentic.inspection.inspector import (
+                            inspect_tool_result as run_inspection,
+                        )
+
+                        anthropic_route = self._model_route.route in {
+                            "anthropic",
+                            "vertex/anthropic",
+                            "bedrock/anthropic",
+                        }
+                        classifier_model = self._model_route.create_model(
+                            self._model_route.model_parameters, None
+                        )
+                        # nostream hides graph events, not SDK transport streaming.
+                        classifier_model.disable_streaming = True
+                        if self._model_route.create_classifier_client is not None:
+                            classifier_client = self._model_route.create_classifier_client(
+                                classifier_model
+                            )
+                        else:
+                            classifier_client = LangChainClassifierClient(
+                                classifier_model,
+                                method="json_schema" if anthropic_route else "function_calling",
+                                native_json_schema=self._model_route.route == "vertex/anthropic",
+                            )
+                        model_profile = getattr(classifier_model, "profile", None) or {}
+                        context_window_tokens = (
+                            model_profile.get("max_input_tokens")
+                            or model_profile.get("max_context_size")
+                            or 100_000
+                        )
+
+                        async def inspect_tool_result_callback(
+                            tool_name: str,
+                            result_type: str,
+                            value: Any,
+                            tool_call_id: str,
+                        ) -> Any:
+                            return await run_inspection(
+                                classifier_client,
+                                tool_name=tool_name,
+                                result_type=result_type,
+                                value=value,
+                                codec=Utf8ByteCodec(),
+                                tool_call_id=tool_call_id or None,
+                                context_window_tokens=context_window_tokens,
+                                instruction_tokens=512,
+                                deadline=options.deadline,
+                                provider=self._model_route.telemetry_provider,
+                                model=self._model_route.model,
+                            )
+
+                        inspector_callback = inspect_tool_result_callback
+                    except Exception as exc:
+                        raise ToolResultSafetyInspectionFailed() from exc
+
+                def notify_accepted_results(messages: Sequence[Any]) -> None:
+                    from langgraph.config import get_stream_writer
+
+                    signatures = {
+                        tool_result_signature(
+                            message.name or "",
+                            "error" if message.status == "error" else "result",
+                            message.tool_call_id or "",
+                            message.content,
+                        )
+                        for message in messages
                     }
-                    classifier_model = self._model_route.create_model(
-                        self._model_route.model_parameters, None
-                    )
-                    # nostream hides graph events, not SDK transport streaming.
-                    classifier_model.disable_streaming = True
-                    if self._model_route.create_classifier_client is not None:
-                        classifier_client = self._model_route.create_classifier_client(
-                            classifier_model
-                        )
-                    else:
-                        classifier_client = LangChainClassifierClient(
-                            classifier_model,
-                            method="json_schema" if anthropic_route else "function_calling",
-                            native_json_schema=self._model_route.route == "vertex/anthropic",
-                        )
-                    model_profile = getattr(classifier_model, "profile", None) or {}
-                    context_window_tokens = (
-                        model_profile.get("max_input_tokens")
-                        or model_profile.get("max_context_size")
-                        or 100_000
-                    )
+                    get_stream_writer()({"lightspeed.accepted_tool_results": signatures})
 
-                    async def inspect_tool_result_callback(
-                        tool_name: str,
-                        result_type: str,
-                        value: Any,
-                        tool_call_id: str,
-                    ) -> Any:
-                        return await run_inspection(
-                            classifier_client,
-                            tool_name=tool_name,
-                            result_type=result_type,
-                            value=value,
-                            codec=Utf8ByteCodec(),
-                            tool_call_id=tool_call_id or None,
-                            context_window_tokens=context_window_tokens,
-                            instruction_tokens=512,
-                            deadline=options.deadline,
-                            provider=self._model_route.telemetry_provider,
-                            model=self._model_route.model,
+                inspection_middleware = ToolResultInspectionMiddleware(
+                    inspector_callback,
+                    on_accepted=(
+                        notify_accepted_results if inspector_callback is not None else None
+                    ),
+                    redaction_rules=self._redaction_rules,
+                    trusted_tool_names=(
+                        frozenset({"ask_user"})
+                        if session is not None and session.user_input_callback is not None
+                        else frozenset()
+                    ),
+                )
+                summarization_middleware = create_tool_data_summarization_middleware(
+                    chat_model, backend
+                )
+                output_limit_middleware = _create_output_limit_middleware()
+                middleware = [
+                    inspection_middleware,
+                    summarization_middleware,
+                    output_limit_middleware,
+                ]
+                if session is not None:
+                    from lightspeed_agentic.session import create_session_tool_middleware
+
+                    middleware = [*middleware, create_session_tool_middleware(session)]
+                agent_kwargs["middleware"] = middleware
+                subagent_spec["middleware"] = (
+                    [
+                        create_session_tool_middleware(session, consume_steering=False),
+                        inspection_middleware,
+                        summarization_middleware,
+                        output_limit_middleware,
+                    ]
+                    if session is not None
+                    else middleware
+                )
+                agent_kwargs["subagents"] = [subagent_spec]
+
+                if skill_sources:
+                    agent_kwargs["skills"] = skill_sources
+
+                mcp_tools: list[Any] = []
+                if options.mcp_servers:
+                    from langchain_mcp_adapters.client import MultiServerMCPClient
+
+                    from lightspeed_agentic.tls import create_async_http_client
+
+                    try:
+                        client = MultiServerMCPClient(
+                            {
+                                server.name: {  # type: ignore[misc]
+                                    "transport": "http",
+                                    "url": server.url,
+                                    "headers": {h.name: h.value for h in server.headers},
+                                    "timeout": server.timeout,
+                                    "httpx_client_factory": create_async_http_client,
+                                }
+                                for server in options.mcp_servers
+                            }
                         )
+                    except Exception as exc:
+                        raise MCPInitializationError(
+                            server_names=tuple(server.name for server in options.mcp_servers),
+                            error_type=type(exc).__name__,
+                        ) from None
+                    tool_owners: dict[str, str] = {}
+                    for server in options.mcp_servers:
+                        allowed_tool_names = set(server.allowed_tool_names)
+                        try:
+                            server_tools = await client.get_tools(server_name=server.name)
+                        except Exception as exc:
+                            raise MCPInitializationError(
+                                server_names=(server.name,), error_type=type(exc).__name__
+                            ) from None
+                        for tool in server_tools:
+                            if tool.name not in allowed_tool_names:
+                                continue
+                            if (
+                                tool.name == "ask_user"
+                                and session is not None
+                                and session.user_input_callback is not None
+                            ):
+                                raise MCPToolNameCollisionError(
+                                    tool_name=tool.name,
+                                    server_names=("runtime", server.name),
+                                )
+                            if tool.name in tool_owners:
+                                raise MCPToolNameCollisionError(
+                                    tool_name=tool.name,
+                                    server_names=(tool_owners[tool.name], server.name),
+                                )
+                            tool_owners[tool.name] = server.name
+                            mcp_tools.append(tool)
 
-                    inspector_callback = inspect_tool_result_callback
-                except Exception as exc:
-                    raise ToolResultSafetyInspectionFailed() from exc
+                if session is not None:
+                    from langgraph.checkpoint.memory import InMemorySaver
 
+                    from lightspeed_agentic.session import create_ask_user_tool
+
+                    agent_kwargs["checkpointer"] = InMemorySaver()
+                    if session.user_input_callback is not None:
+                        mcp_tools.append(create_ask_user_tool(session))
+                if mcp_tools:
+                    agent_kwargs["tools"] = mcp_tools
+
+                agent = create_deep_agent(**agent_kwargs)
+                if session is not None:
+                    session._resources = {
+                        "chat_model": chat_model,
+                        "classifier_model": classifier_model,
+                        "agent": agent,
+                        "inspection_middleware": inspection_middleware,
+                    }
+
+            else:
+                agent = session._resources["agent"]
+                classifier_model = session._resources["classifier_model"]
+                inspection_middleware = session._resources["inspection_middleware"]
+            return {
+                "agent": agent,
+                "chat_model": chat_model,
+                "classifier_model": classifier_model,
+                "inspection_middleware": inspection_middleware,
+                "schema_model": schema_model,
+                "prepared_schema": prepared_schema,
+            }
+        except BaseException:
+            if session is None or not session._resources:
+                await _close_model_clients(chat_model)
+                if classifier_model is not None:
+                    await _close_model_clients(classifier_model)
+            raise
+
+    async def _query(
+        self,
+        options: ProviderQueryOptions,
+        *,
+        session: RuntimeSession | None = None,
+    ) -> AsyncIterator[ProviderEvent]:
+        parent_context = otel_context.get_current()
+        from lightspeed_agentic.inspection.errors import ToolResultSafetyInspectionFailed
+        from lightspeed_agentic.providers.tool_result_middleware import tool_result_signature
+
+        prepared = await self.prepare_graph(options, session=session)
+        agent = prepared["agent"]
+        chat_model = prepared["chat_model"]
+        classifier_model = prepared["classifier_model"]
+        inspection_middleware = prepared["inspection_middleware"]
+        schema_model = prepared["schema_model"]
+        prepared_schema = prepared["prepared_schema"]
+        generation_callback: Any | None = None
+        try:
             generation_callback = _create_generation_callback(
                 self._model_route,
                 parent_context,
-                main_name=agent_kwargs.get("name"),
+                main_name=None,
+                usage_observer=(session._observe_usage if session is not None else None),
             )
             tool_results_by_signature: dict[tuple[str, str, str, str], deque[ToolResultEvent]] = (
                 defaultdict(deque)
@@ -923,88 +1186,13 @@ class DeepAgentsProvider(AgentProvider):
                 tool_results_by_signature[signature].append(event)
                 generation_callback.record_tool_result(message.name or "", event)
 
-            def notify_accepted_results(messages: Sequence[Any]) -> None:
-                from langgraph.config import get_stream_writer
-
-                signatures = {
-                    tool_result_signature(
-                        message.name or "",
-                        "error" if message.status == "error" else "result",
-                        message.tool_call_id or "",
-                        message.content,
-                    )
-                    for message in messages
-                }
-                get_stream_writer()({"lightspeed.accepted_tool_results": signatures})
-
-            inspection_middleware = ToolResultInspectionMiddleware(
-                inspector_callback,
-                on_accepted=(notify_accepted_results if inspector_callback is not None else None),
-                redaction_rules=self._redaction_rules,
-                on_tool_result=retain_tool_result,
-            )
-            summarization_middleware = create_tool_data_summarization_middleware(
-                chat_model, backend
-            )
-            agent_kwargs["middleware"] = [inspection_middleware, summarization_middleware]
-            subagent_spec["middleware"] = [inspection_middleware, summarization_middleware]
-            agent_kwargs["subagents"] = [subagent_spec]
-            if has_skills(skills_root):
-                agent_kwargs["skills"] = ["/skills/"]
-
-            mcp_tools: list[Any] = []
-            if options.mcp_servers:
-                from langchain_mcp_adapters.client import MultiServerMCPClient
-
-                from lightspeed_agentic.tls import create_async_http_client
-
-                try:
-                    client = MultiServerMCPClient(
-                        {
-                            server.name: {  # type: ignore[misc]
-                                "transport": "http",
-                                "url": server.url,
-                                "headers": {h.name: h.value for h in server.headers},
-                                "timeout": server.timeout,
-                                "httpx_client_factory": create_async_http_client,
-                            }
-                            for server in options.mcp_servers
-                        }
-                    )
-                except Exception as exc:
-                    raise MCPInitializationError(
-                        server_names=tuple(server.name for server in options.mcp_servers),
-                        error_type=type(exc).__name__,
-                    ) from None
-                tool_owners: dict[str, str] = {}
-                for server in options.mcp_servers:
-                    allowed_tool_names = set(server.allowed_tool_names)
-                    try:
-                        server_tools = await client.get_tools(server_name=server.name)
-                    except Exception as exc:
-                        raise MCPInitializationError(
-                            server_names=(server.name,), error_type=type(exc).__name__
-                        ) from None
-                    for tool in server_tools:
-                        if tool.name not in allowed_tool_names:
-                            continue
-                        if tool.name in tool_owners:
-                            raise MCPToolNameCollisionError(
-                                tool_name=tool.name,
-                                server_names=(tool_owners[tool.name], server.name),
-                            )
-                        tool_owners[tool.name] = server.name
-                        mcp_tools.append(tool)
-
-            if mcp_tools:
-                agent_kwargs["tools"] = mcp_tools
-
-            agent = create_deep_agent(**agent_kwargs)
-
-            thread_id = f"ls-{uuid.uuid4().hex[:12]}"
+            inspection_middleware._on_tool_result = retain_tool_result
+            thread_id = session.session_id if session is not None else f"ls-{uuid.uuid4().hex[:12]}"
             stream_config: dict[str, Any] = {
                 "configurable": {"thread_id": thread_id},
-                "recursion_limit": options.max_turns,
+                "recursion_limit": (
+                    max(1000, options.max_turns * 20) if session is not None else options.max_turns
+                ),
             }
             stream_config["callbacks"] = [generation_callback]
             result_text = ""
@@ -1133,11 +1321,13 @@ class DeepAgentsProvider(AgentProvider):
                 generation_callback.close_open(type(exc).__name__)
             raise
         finally:
+            inspection_middleware._on_tool_result = None
             if generation_callback is not None:
                 generation_callback.close_open("generation_interrupted")
-            await _close_model_clients(chat_model)
-            if classifier_model is not None:
-                await _close_model_clients(classifier_model)
+            if session is None or not session._resources:
+                await _close_model_clients(chat_model)
+                if classifier_model is not None:
+                    await _close_model_clients(classifier_model)
 
         if schema_model is not None:
             structured, in_tok, out_tok = await _shape_structured_output(

@@ -58,6 +58,25 @@ class ToolResultEvent:
 
 
 @dataclass(frozen=True)
+class UserMessageEvent:
+    type: Literal["user_message"] = field(default="user_message", init=False)
+    text: str = ""
+    message_id: str = ""
+
+
+@dataclass(frozen=True)
+class UsageSnapshot:
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
+
+@dataclass(frozen=True)
+class UsageEvent:
+    type: Literal["usage"] = field(default="usage", init=False)
+    usage: UsageSnapshot = field(default_factory=UsageSnapshot)
+
+
+@dataclass(frozen=True)
 class ResultEvent:
     type: Literal["result"] = field(default="result", init=False)
     text: str = ""
@@ -65,6 +84,8 @@ class ResultEvent:
     output_tokens: int = 0
     reasoning_tokens: int = 0
     response_model: str = ""
+    stop_reason: Literal["end_turn", "max_turns", "cancelled"] = "end_turn"
+    turns_used: int | None = None
 
 
 ProviderEvent = (
@@ -74,6 +95,8 @@ ProviderEvent = (
     | ToolCallEvent
     | ToolResultEvent
     | ResultEvent
+    | UsageEvent
+    | UserMessageEvent
 )
 
 
@@ -86,8 +109,16 @@ class ProviderQueryOptions:
     output_schema: dict[str, Any] | None = None
     mcp_servers: list[AdmittedMCPProviderServer] = field(default_factory=list)
     reasoning_config: dict[str, Any] | None = None
+    max_output_tokens: int | None = None
     tool_output_inspection_enabled: bool = True
     deadline: float | None = None
+
+
+class ModelOutputLimitError(RuntimeError):
+    """A provider explicitly reported an incomplete model generation."""
+
+    def __init__(self) -> None:
+        super().__init__("Model response reached its output token limit.")
 
 
 class MCPInitializationError(RuntimeError):

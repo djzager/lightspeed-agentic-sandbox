@@ -193,9 +193,11 @@ class ToolResultInspectionMiddleware(AgentMiddleware[Any, Any, Any]):
         inspector: ToolResultInspector | None = None,
         *,
         on_accepted: Callable[[Sequence[ToolMessage]], None] | None = None,
+        trusted_tool_names: frozenset[str] = frozenset(),
         redaction_rules: CompiledRuleSet | None = None,
         on_tool_result: Callable[[ToolMessage, ToolResultEvent], None] | None = None,
     ) -> None:
+        self._trusted_tool_names = trusted_tool_names
         self._inspector = inspector
         self._on_accepted = on_accepted
         self._redaction_rules = redaction_rules
@@ -231,7 +233,8 @@ class ToolResultInspectionMiddleware(AgentMiddleware[Any, Any, Any]):
 
     async def awrap_model_call(self, request: Any, handler: Callable[[Any], Awaitable[Any]]) -> Any:
         untrusted_results = {
-            id(message) for message in filter_untrusted_tool_results(request.messages)
+            id(message)
+            for message in filter_untrusted_tool_results(request.messages, self._trusted_tool_names)
         }
         for message in request.messages:
             if not isinstance(message, ToolMessage) or self._inspector is None:
