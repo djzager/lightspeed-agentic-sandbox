@@ -572,6 +572,101 @@ async def test_fail_closed_inputs_auth_and_payload_free_errors(tmp_path, capsys,
     assert "supersecret" not in caplog.text
 
 
+@pytest.mark.parametrize(
+    ("status", "error_type", "code", "summary", "reason"),
+    [
+        (401, "authentication_error", "secret-code", "authentication failed", "unknown"),
+        (403, "permission_error", None, "access denied", "unknown"),
+        (429, "rate_limit_error", None, "rate limit exceeded", "unknown"),
+        (
+            400,
+            "secret-type",
+            "context_length_exceeded",
+            "request rejected",
+            "context_length_exceeded",
+        ),
+        (503, "api_error", "secret-code", "service unavailable", "unknown"),
+    ],
+)
+async def test_provider_failures_keep_safe_diagnostics_on_wire_and_replay(
+    tmp_path, monkeypatch, capsys, caplog, status, error_type, code, summary, reason
+):
+    import httpx
+
+    openai = pytest.importorskip("openai")
+    body = {
+        "error": {
+            "message": (
+                "provider-response-supersecret credential-supersecret request-body-supersecret"
+            ),
+            "type": error_type,
+            "code": code,
+            "details": "tool-output-supersecret",
+        }
+    }
+    failure = openai.APIStatusError(
+        "exception-message-supersecret",
+        response=httpx.Response(
+            status,
+            request=httpx.Request("POST", "https://user:password-supersecret@example.invalid"),
+            headers={"secret-header": "header-supersecret"},
+        ),
+        body=body,
+    )
+
+    async def failing_stream(_self, *_args, **_kwargs):
+        raise failure
+        yield  # make this an async iterator, like the real graph
+
+    monkeypatch.setattr(FakeGraph, "astream", failing_stream)
+    async with server(tmp_path) as (url, _provider, config):
+        async with connect(url) as ws:
+            session_id = await initialize(ws, config)
+            await send(ws, 3, "session/prompt", prompt(session_id, "run fixture"))
+            result, notifications = await response(ws, 3)
+            error = result["error"]
+            assert error["message"] == f"Model provider {summary} (HTTP {status})."
+            assert error["data"] == {
+                "kind": "provider_error",
+                "statusCode": status,
+                "errorType": error_type if not error_type.startswith("secret") else None,
+                "reason": reason,
+            }
+        # Reconnect replay must never retrieve the provider's original exception/body.
+        async with connect(url) as viewer:
+            await send(viewer, 4, "initialize", {"protocolVersion": 1})
+            await response(viewer, 4)
+            await send(
+                viewer,
+                5,
+                "session/load",
+                {"sessionId": session_id, "cwd": config.cwd, "mcpServers": []},
+            )
+            replay_result, replay = await response(viewer, 5)
+            assert "result" in replay_result
+    wire = json.dumps([result, notifications, replay_result, replay])
+    captured = capsys.readouterr()
+    assert "supersecret" not in wire + caplog.text + captured.out + captured.err
+    assert "secret-code" not in wire
+    assert "secret-type" not in wire
+
+
+async def test_sdk_request_error_does_not_forward_untrusted_data(tmp_path, monkeypatch, caplog):
+    from acp.exceptions import RequestError
+
+    async def failing_stream(_self, *_args, **_kwargs):
+        raise RequestError(-32603, "message-supersecret", {"response": "data-supersecret"})
+        yield
+
+    monkeypatch.setattr(FakeGraph, "astream", failing_stream)
+    async with server(tmp_path) as (url, _provider, config), connect(url) as ws:
+        session_id = await initialize(ws, config)
+        await send(ws, 3, "session/prompt", prompt(session_id, "run fixture"))
+        result, notifications = await response(ws, 3)
+    assert result["error"] == {"code": -32603, "message": "runtime operation failed"}
+    assert "supersecret" not in json.dumps([result, notifications]) + caplog.text
+
+
 async def test_sigterm_cleans_active_session_and_provider(tmp_path):
     script = tmp_path / "signal_runtime.py"
     script.write_text("""import asyncio, sys

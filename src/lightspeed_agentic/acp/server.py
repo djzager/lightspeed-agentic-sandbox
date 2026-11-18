@@ -29,6 +29,39 @@ class RPCError(Exception):
         self.data = data
 
 
+def _operation_error(exc: Exception) -> dict[str, Any]:
+    """Project errors onto bounded diagnostics, never provider messages or SDK data."""
+    from acp.exceptions import RequestError
+    from pydantic import ValidationError
+
+    from lightspeed_agentic.inspection.errors import provider_error_metadata
+
+    code = (
+        exc.code
+        if isinstance(exc, RequestError)
+        else (-32602 if isinstance(exc, ValidationError) else -32603)
+    )
+    error: dict[str, Any] = {"code": code, "message": "runtime operation failed"}
+    status, error_type, reason = provider_error_metadata(exc)
+    if status is not None:
+        summary = {
+            401: "authentication failed",
+            403: "access denied",
+            429: "rate limit exceeded",
+        }.get(
+            status,
+            "service unavailable" if status >= 500 else "request rejected",
+        )
+        error["message"] = f"Model provider {summary} (HTTP {status})."
+        error["data"] = {
+            "kind": "provider_error",
+            "statusCode": status,
+            "errorType": error_type,
+            "reason": reason,
+        }
+    return error
+
+
 def _prompt(params: dict[str, Any]) -> str:
     blocks = params.get("prompt")
     if not isinstance(blocks, list) or not blocks:
@@ -215,22 +248,10 @@ class ACPConnection:
                     }
                 )
         except Exception as exc:
-            from acp.exceptions import RequestError
-            from pydantic import ValidationError
-
-            code = (
-                exc.code
-                if isinstance(exc, RequestError)
-                else (-32602 if isinstance(exc, ValidationError) else -32603)
-            )
-            # Model, subprocess, and validation exceptions can contain secrets/content.
+            # SDK RequestError.data, messages, and chained causes can hold raw
+            # provider responses or tool content. Only the safe projection leaves.
             if is_request:
-                await self.send(
-                    {
-                        "id": request_id,
-                        "error": {"code": code, "message": "runtime operation failed"},
-                    }
-                )
+                await self.send({"id": request_id, "error": _operation_error(exc)})
         finally:
             if registered:
                 self.request_ids.discard(request_id)

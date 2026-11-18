@@ -216,3 +216,7 @@ model cancellation, timeout repair, shaping, failed edit results and terminal
 steering/cancel races. `tests/test_acp.py` and `tests/test_acp_ui.py` cover real
 loopback WebSocket framing, host policy, permission/question concurrency, trusted
 stdio cleanup and existing UI wire behavior. No paid model or cluster is needed.
+
+Provider failures with recognized HTTP status metadata return fixed summaries and
+bounded status/allowlisted type/reason data over ACP; arbitrary provider wording,
+response bodies, SDK error data, and chained exceptions remain private.
